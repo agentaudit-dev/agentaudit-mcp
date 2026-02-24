@@ -29,6 +29,7 @@ import os from 'os';
 import path from 'path';
 import { execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { scanTools, extractToolDefinitions } from './tool-poisoning-detector.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname);
@@ -279,7 +280,7 @@ async function checkRegistry(slug) {
 // ── MCP Server ───────────────────────────────────────────
 
 const server = new Server(
-  { name: 'agentaudit', version: '3.10.0' },
+  { name: 'agentaudit', version: '3.11.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -338,6 +339,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['package_name'],
+      },
+    },
+    {
+      name: 'scan_tool_poisoning',
+      description: 'Scan MCP tool definitions for hidden instructions, unicode tricks, obfuscated payloads, and manipulation patterns. Use this to check if a server\'s tools contain poisoning indicators (prompt injection in descriptions, zero-width characters, cross-tool manipulation, homoglyph attacks). Provide tool definitions directly OR a source_url to extract them from code.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tool_definitions: {
+            type: 'array',
+            description: 'Array of tool definition objects to scan. Each object should have: name (string), description (string), inputSchema (object, optional).',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                description: { type: 'string' },
+                inputSchema: { type: 'object' },
+              },
+              required: ['name'],
+            },
+          },
+          source_url: {
+            type: 'string',
+            description: 'Git repository URL. If provided (and no tool_definitions), will clone the repo and attempt to statically extract tool definitions from source code.',
+          },
+          server_name: {
+            type: 'string',
+            description: 'Name of the MCP server being scanned (for reporting purposes).',
+          },
+        },
       },
     },
   ],
@@ -604,8 +635,94 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
+    // ── scan_tool_poisoning ──────────────────────────────────
+    case 'scan_tool_poisoning': {
+      const serverName = args.server_name || 'unknown';
+      let toolDefs = args.tool_definitions;
+
+      // If no tool definitions provided but source_url given, try static extraction
+      if ((!toolDefs || !Array.isArray(toolDefs) || toolDefs.length === 0) && args.source_url) {
+        const sourceUrl = args.source_url;
+        if (!sourceUrl.startsWith('http')) {
+          return { content: [{ type: 'text', text: 'Error: source_url must be a valid HTTP(S) URL' }] };
+        }
+
+        let repoPath;
+        try {
+          repoPath = cloneRepo(sourceUrl);
+          const files = collectFiles(repoPath);
+          toolDefs = extractToolDefinitions(files);
+
+          if (toolDefs.length === 0) {
+            return { content: [{ type: 'text', text: `No tool definitions found in ${sourceUrl}.\n\nThe static extractor could not find MCP tool definitions in the source code. This can happen if:\n- The tools are defined dynamically at runtime\n- The code uses an unsupported framework/pattern\n- The repository is not an MCP server\n\nTry providing tool_definitions directly instead (you can get them from the server's ListTools response).` }] };
+          }
+        } catch (err) {
+          return { content: [{ type: 'text', text: `Error cloning/analyzing repo: ${err.message}` }] };
+        } finally {
+          if (repoPath) cleanupRepo(repoPath);
+        }
+      }
+
+      if (!toolDefs || !Array.isArray(toolDefs) || toolDefs.length === 0) {
+        return { content: [{ type: 'text', text: 'Error: Provide either tool_definitions (array of {name, description, inputSchema}) or source_url (Git repo URL).\n\nTo get tool definitions from a running MCP server, you can use the ListTools request and pass the result here.' }] };
+      }
+
+      // Run the scan
+      const result = scanTools(toolDefs, { server_name: serverName, include_info: false });
+
+      // Format output
+      let text = `# Tool Poisoning Scan: ${serverName}\n\n`;
+      text += `**Tools scanned:** ${result.summary.tools_scanned}\n`;
+      text += `**Findings:** ${result.summary.total_findings}\n`;
+      text += `**Risk level:** ${result.summary.risk_level.toUpperCase()}\n\n`;
+
+      if (result.summary.clean) {
+        text += `✅ **CLEAN** — No poisoning indicators detected.\n\n`;
+        text += `> ${result.summary.disclaimer}\n`;
+      } else {
+        // Group findings by severity
+        const bySev = {};
+        for (const f of result.findings) {
+          if (!bySev[f.severity]) bySev[f.severity] = [];
+          bySev[f.severity].push(f);
+        }
+
+        const sevOrder = ['critical', 'high', 'medium', 'warning', 'low'];
+        const sevEmoji = { critical: '🚨', high: '⚠️', medium: '🔶', warning: '🔷', low: 'ℹ️' };
+
+        for (const sev of sevOrder) {
+          if (!bySev[sev]) continue;
+          text += `## ${sevEmoji[sev]} ${sev.toUpperCase()} (${bySev[sev].length})\n\n`;
+          for (const f of bySev[sev]) {
+            text += `### ${f.pattern_id}: ${f.title}\n`;
+            text += `- **Tool:** ${f.tool_name} | **Field:** ${f.field}\n`;
+            text += `- **Category:** ${f.category} | **Confidence:** ${f.confidence}\n`;
+            text += `- ${f.description}\n`;
+            if (f.evidence) text += `- **Evidence:** \`${f.evidence.slice(0, 200)}\`\n`;
+            text += `\n`;
+          }
+        }
+
+        text += `---\n\n`;
+        text += `**Summary by category:**\n`;
+        for (const [cat, count] of Object.entries(result.summary.by_category)) {
+          text += `- ${cat}: ${count}\n`;
+        }
+        text += `\n> ${result.summary.disclaimer}\n`;
+
+        // Actionable advice
+        if (result.summary.risk_level === 'critical') {
+          text += `\n🚨 **CRITICAL RISK — DO NOT USE THIS SERVER.** The tool definitions contain strong indicators of malicious intent. Inform the user and recommend removing this MCP server immediately.\n`;
+        } else if (result.summary.risk_level === 'high') {
+          text += `\n⚠️ **HIGH RISK — Exercise extreme caution.** The tool definitions contain suspicious patterns that may indicate an attack. Recommend the user review the findings before using this server.\n`;
+        }
+      }
+
+      return { content: [{ type: 'text', text }] };
+    }
+
     default:
-      return { content: [{ type: 'text', text: `Unknown tool: ${name}. Available: discover_servers, audit_package, submit_report, check_package` }] };
+      return { content: [{ type: 'text', text: `Unknown tool: ${name}. Available: discover_servers, audit_package, submit_report, check_package, scan_tool_poisoning` }] };
   }
 });
 

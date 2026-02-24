@@ -1,6 +1,6 @@
 {
   "name": "agentaudit",
-  "version": "3.10.0",
+  "version": "3.11.0",
   "description": "Security scanner for AI packages — MCP server + CLI",
   "type": "module",
   "bin": {
@@ -11,6 +11,8 @@
     "index.mjs",
     "cli.mjs",
     "postinstall.mjs",
+    "tool-poisoning-detector.mjs",
+    "scan-tool-poisoning.mjs",
     "prompts/audit-prompt.md",
     "LICENSE",
     "README.md"
@@ -18,6 +20,7 @@
   "scripts": {
     "start": "node index.mjs",
     "scan": "node cli.mjs scan",
+    "scan-tools": "node scan-tool-poisoning.mjs",
     "postinstall": "node postinstall.mjs"
   },
   "keywords": [
@@ -29,6 +32,7 @@
     "scanner",
     "vulnerability",
     "prompt-injection",
+    "tool-poisoning",
     "agent-security"
   ],
   "author": "agentaudit-dev",
