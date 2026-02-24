@@ -1,0 +1,13 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.agentaudit-dev/agentaudit",
+  "description": "Security scanner for AI packages — scans MCP servers, AI skills, and packages for vulnerabilities, prompt injection, and supply chain attacks. Powered by regex static analysis and deep LLM audits.",
+  "version": "3.10.0",
+  "packages": [
+    {
+      "registry_type": "npm",
+      "identifier": "agentaudit",
+      "version": "3.10.0"
+    }
+  ]
+}
