@@ -1053,7 +1053,24 @@ function detectPackageInfo(repoPath, files) {
   for (const ef of entryFiles) {
     if (files.some(f => f.path === ef)) { info.entrypoint = ef; break; }
   }
-  
+
+  // Extract package version from manifest files
+  info.version = null;
+  const versionSources = [
+    { file: 'package.json', extract: c => { try { return JSON.parse(c).version; } catch { return null; } } },
+    { file: 'pyproject.toml', extract: c => { const m = c.match(/^\s*version\s*=\s*["']([^"']+)["']/m); return m?.[1] || null; } },
+    { file: 'setup.py', extract: c => { const m = c.match(/version\s*=\s*["']([^"']+)["']/); return m?.[1] || null; } },
+    { file: 'setup.cfg', extract: c => { const m = c.match(/^\s*version\s*=\s*(.+)$/m); return m?.[1]?.trim() || null; } },
+    { file: 'Cargo.toml', extract: c => { const m = c.match(/^\s*version\s*=\s*["']([^"']+)["']/m); return m?.[1] || null; } },
+  ];
+  for (const vs of versionSources) {
+    const f = files.find(f => f.path === vs.file || f.path.endsWith('/' + vs.file));
+    if (f) {
+      const v = vs.extract(f.content);
+      if (v) { info.version = v; break; }
+    }
+  }
+
   return info;
 }
 
@@ -2655,6 +2672,134 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
   }
 }
 
+// ── Deterministic post-processing for LLM reports ────────────────────────
+// Fills in missing fields that LLMs often omit, using deterministic lookups
+
+const PATTERN_CWE_MAP = {
+  CMD_INJECT: 'CWE-78', CRED_THEFT: 'CWE-522', DATA_EXFIL: 'CWE-200',
+  DESTRUCT: 'CWE-912', OBF: 'CWE-506', SANDBOX_ESC: 'CWE-693',
+  SUPPLY_CHAIN: 'CWE-1357', SOCIAL_ENG: 'CWE-451', PRIV_ESC: 'CWE-269',
+  INFO_LEAK: 'CWE-200', CRYPTO_WEAK: 'CWE-327', DESER: 'CWE-502',
+  PATH_TRAV: 'CWE-22', SEC_BYPASS: 'CWE-693', PERSIST: 'CWE-912',
+  AI_PROMPT: 'CWE-1426', MCP_POISON: 'CWE-1426', MCP_INJECT: 'CWE-94',
+  MCP_TRAVERSAL: 'CWE-22', MCP_SUPPLY: 'CWE-1357', MCP_PERM: 'CWE-269',
+  WORM: 'CWE-912', CICD: 'CWE-912', CORR: 'CWE-829', MANUAL: 'CWE-693',
+};
+
+const SEVERITY_IMPACT = { critical: -25, high: -15, medium: -5, low: -1 };
+
+const REMEDIATION_TEMPLATES = {
+  CMD_INJECT: 'Validate and sanitize input; use allowlists or parameterized execution instead of shell strings',
+  CRED_THEFT: 'Remove hardcoded credentials; use environment variables or a secrets manager',
+  DATA_EXFIL: 'Remove or document the external data transmission; ensure user consent',
+  DESTRUCT: 'Add confirmation prompts and safeguards before destructive operations',
+  OBF: 'Replace obfuscated code with readable equivalents; document the purpose',
+  SANDBOX_ESC: 'Restrict file and process access to configured boundaries',
+  SUPPLY_CHAIN: 'Pin dependency versions; verify package integrity',
+  SOCIAL_ENG: 'Align documentation with actual code behavior',
+  PRIV_ESC: 'Apply principle of least privilege; remove unnecessary elevated permissions',
+  INFO_LEAK: 'Restrict exposed information to what is necessary for operation',
+  CRYPTO_WEAK: 'Use modern cryptographic algorithms (AES-256, SHA-256+)',
+  DESER: 'Use safe deserialization (e.g. yaml.safe_load, JSON) instead of unsafe loaders',
+  PATH_TRAV: 'Sanitize file paths; reject inputs containing .. or absolute paths',
+  SEC_BYPASS: 'Do not disable security controls; use proper certificate validation',
+  PERSIST: 'Remove persistence mechanisms or require explicit user opt-in',
+  AI_PROMPT: 'Remove hidden instructions; ensure tool descriptions are transparent',
+  MCP_POISON: 'Remove injected instructions from tool descriptions and schemas',
+  MCP_INJECT: 'Sanitize tool arguments and descriptions; prevent prompt injection',
+  MCP_TRAVERSAL: 'Validate and sandbox file paths in MCP tool handlers',
+  MCP_SUPPLY: 'Pin MCP package versions; verify transport configurations',
+  MCP_PERM: 'Restrict permissions to minimum required scope; remove wildcard grants',
+};
+
+function enrichFindings(report, files, pkgInfo) {
+  if (!report || !report.findings) return report;
+
+  // Ensure package_version
+  if (!report.package_version || report.package_version === 'unknown') {
+    report.package_version = pkgInfo.version || 'unknown';
+  }
+
+  // Ensure max_severity
+  const severities = ['critical', 'high', 'medium', 'low'];
+  let maxSev = 'none';
+  for (const f of report.findings) {
+    const idx = severities.indexOf((f.severity || '').toLowerCase());
+    if (idx !== -1 && idx < severities.indexOf(maxSev === 'none' ? 'low' : maxSev)) {
+      maxSev = severities[idx];
+    }
+  }
+  // Only override if not set or wrong
+  if (!report.max_severity || report.max_severity === 'none') {
+    report.max_severity = report.findings.length > 0 ? maxSev : 'none';
+  }
+
+  for (const finding of report.findings) {
+    // 1. Fill cwe_id from pattern_id lookup
+    if (!finding.cwe_id || finding.cwe_id === '') {
+      const prefix = (finding.pattern_id || '').replace(/_\d+$/, '');
+      finding.cwe_id = PATTERN_CWE_MAP[prefix] || 'CWE-693';
+    }
+
+    // 2. Fill content (code snippet) from files array
+    if ((!finding.content || finding.content === '' || finding.content === '...') && finding.file && finding.line) {
+      const matchFile = files.find(f => f.path === finding.file || f.path.endsWith('/' + finding.file));
+      if (matchFile) {
+        const lines = matchFile.content.split('\n');
+        const lineIdx = finding.line - 1;
+        if (lineIdx >= 0 && lineIdx < lines.length) {
+          // Extract 1-3 lines around the target
+          const start = Math.max(0, lineIdx - 1);
+          const end = Math.min(lines.length, lineIdx + 2);
+          finding.content = lines.slice(start, end).map(l => l.trimEnd()).join('\n').trim();
+        }
+      }
+    }
+
+    // 3. Fill remediation from template
+    if (!finding.remediation || finding.remediation === '' || finding.remediation === '...') {
+      const prefix = (finding.pattern_id || '').replace(/_\d+$/, '');
+      finding.remediation = REMEDIATION_TEMPLATES[prefix] || 'Review and address the identified security concern';
+    }
+
+    // 4. Ensure score_impact is set correctly
+    if (finding.score_impact === undefined || finding.score_impact === null) {
+      if (finding.by_design) {
+        finding.score_impact = 0;
+      } else {
+        finding.score_impact = SEVERITY_IMPACT[(finding.severity || '').toLowerCase()] || -5;
+      }
+    }
+
+    // 5. Ensure confidence has valid value
+    if (!['high', 'medium', 'low'].includes(finding.confidence)) {
+      finding.confidence = 'medium';
+    }
+
+    // 6. Ensure by_design is boolean
+    if (typeof finding.by_design !== 'boolean') {
+      finding.by_design = false;
+    }
+  }
+
+  // Recalculate risk_score from findings
+  const computedRisk = report.findings.reduce((sum, f) => {
+    if (f.by_design) return sum;
+    return sum + Math.abs(f.score_impact || 0);
+  }, 0);
+  report.risk_score = Math.min(100, computedRisk);
+
+  // Ensure result matches risk_score
+  if (report.risk_score <= 25) report.result = 'safe';
+  else if (report.risk_score <= 50) report.result = 'caution';
+  else report.result = 'unsafe';
+
+  // Ensure findings_count
+  report.findings_count = report.findings.length;
+
+  return report;
+}
+
 async function auditRepo(url) {
   const start = Date.now();
   const slug = slugFromUrl(url);
@@ -2712,15 +2857,17 @@ async function auditRepo(url) {
 
   // Build prompts
   const systemPrompt = auditPrompt || 'You are a security auditor. Analyze the code and report findings as JSON.';
+  const detectedVersion = pkgInfo.version || 'unknown';
   const userMessage = [
     `Audit this package: **${slug}** (${url})`,
+    `Package version detected: ${detectedVersion}`,
     ``,
-    `After analysis, respond with ONLY a valid JSON object. No markdown fences, no explanation, no text before or after. Just the raw JSON:`,
-    `{ "skill_slug": "${slug}", "source_url": "${url}", "package_type": "<mcp-server|agent-skill|library|cli-tool|other>",`,
-    `  "risk_score": <0-100>, "result": "<safe|caution|unsafe>", "max_severity": "<none|low|medium|high|critical>",`,
-    `  "findings_count": <n>, "findings": [{ "pattern_id": "CMD_INJECT_001", "title": "...", "severity": "...", "category": "...",`,
-    `  "cwe_id": "CWE-78", "description": "...", "file": "...", "line": <n>, "content": "...", "remediation": "...",`,
-    `  "confidence": "high|medium|low", "by_design": false, "score_impact": -15 }] }`,
+    `Respond with ONLY a valid JSON object. No markdown fences, no explanation, no text before or after.`,
+    ``,
+    `Required top-level fields: skill_slug, source_url, package_type, package_version, risk_score, max_severity, result, findings_count, findings`,
+    `Required finding fields (ALL mandatory): pattern_id, cwe_id, severity, title, description, file, line, content, remediation, confidence, by_design, score_impact`,
+    ``,
+    `A finding missing cwe_id, content, or remediation is INVALID — do not emit it.`,
     ``,
     `## Source Code`,
     codeBlock,
@@ -2821,6 +2968,7 @@ async function auditRepo(url) {
       const durSec = Math.round((duration || 0) / 1000);
       console.log(`    ${c.green}✓${c.reset} ${name.padEnd(30)} ${c.green}done${c.reset} ${c.dim}(${durSec}s)${c.reset}`);
       enrichReport(report, duration);
+      enrichFindings(report, files, pkgInfo);
       saveHistory(report);
       reports.push({ name, report });
     }
@@ -2992,6 +3140,7 @@ async function auditRepo(url) {
   }
 
   enrichReport(report);
+  enrichFindings(report, files, pkgInfo);
   saveHistory(report);
 
   // Display results
