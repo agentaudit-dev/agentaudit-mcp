@@ -643,15 +643,17 @@ function padLeft(str, len) {
 
 function drawBox(title, contentLines, width) {
   const inner = width - 4; // 2 for "│ " + 2 for " │"
+  const totalDash = inner + 2; // total horizontal line chars between corners
   const lines = [];
   const titleStr = title ? ` ${title} ` : '';
   const titleLen = visLen(titleStr);
-  const topDash = BOX.h.repeat(Math.max(1, inner + 2 - titleLen));
-  lines.push(`  ${BOX.tl}${c.dim}─${c.reset}${c.bold}${titleStr}${c.reset}${c.dim}${topDash}${c.reset}${BOX.tr}`);
+  // Top: ╭─ Title ────────────╮  (1 dash before title + title + remaining dashes)
+  const topDash = BOX.h.repeat(Math.max(1, totalDash - 1 - titleLen));
+  lines.push(`  ${BOX.tl}${c.dim}${BOX.h}${c.reset}${c.bold}${titleStr}${c.reset}${c.dim}${topDash}${c.reset}${BOX.tr}`);
   for (const line of contentLines) {
     lines.push(`  ${BOX.v} ${padRight(line, inner + 1)}${BOX.v}`);
   }
-  lines.push(`  ${BOX.bl}${c.dim}${BOX.h.repeat(inner + 2)}${c.reset}${BOX.br}`);
+  lines.push(`  ${BOX.bl}${c.dim}${BOX.h.repeat(totalDash)}${c.reset}${BOX.br}`);
   return lines;
 }
 
@@ -929,24 +931,38 @@ function detectPackageInfo(repoPath, files) {
     info.type = 'library';
   }
   
-  // Extract MCP tools (look for tool definitions)
+  // Extract MCP tools — only from files that reference MCP SDK
+  const mcpKeywords = ['modelcontextprotocol', 'FastMCP', 'mcp.server', 'mcp_server', '@mcp.tool', '@server.tool', '.tool(', 'ListTools', 'CallTool'];
+  const mcpFiles = files.filter(f => mcpKeywords.some(kw => f.content.includes(kw)));
+  // Fallback: if no MCP-specific files found, try entrypoint files
+  if (mcpFiles.length === 0) {
+    const entryNames = ['index.js', 'index.ts', 'index.mjs', 'main.py', 'server.py', 'app.py', 'src/index.ts', 'src/main.ts', 'src/index.js'];
+    for (const f of files) {
+      if (entryNames.includes(f.path)) mcpFiles.push(f);
+    }
+  }
+
   const toolPatterns = [
-    // JS/TS: name: 'tool_name' or "tool_name" in tool definitions
-    /(?:name|tool_name)['":\s]+['"]([a-z_][a-z0-9_]*)['"]/gi,
-    // Python: @mcp.tool() def func_name or Tool(name="...")
-    /(?:@(?:mcp|server)\.tool\(\)[\s\S]*?def\s+([a-z_][a-z0-9_]*))|(?:Tool\s*\(\s*name\s*=\s*['"]([a-z_][a-z0-9_]*)['"])/gi,
-    // Direct: tool names in ListTools handlers
-    /['"]name['"]\s*:\s*['"]([a-z_][a-z0-9_]*)['"]/gi,
+    // JS/TS MCP SDK: server.tool('name', ...) or .setTool('name', ...)
+    /\.tool\s*\(\s*['"]([a-z_][a-z0-9_]*)['"]/gi,
+    // Python: @mcp.tool() / @server.tool() followed by def name
+    /@(?:mcp|server)\.tool\s*\(.*?\)[\s\S]*?def\s+([a-z_][a-z0-9_]*)/gi,
+    // Python: Tool(name="xxx")
+    /Tool\s*\(\s*name\s*=\s*['"]([a-z_][a-z0-9_]*)['"]/gi,
+    // ListTools handler: { name: "tool_name", description: ... }
+    /{\s*(?:['"]?)name(?:['"]?)\s*:\s*['"]([a-z_][a-z0-9_]*)['"]\s*,\s*(?:['"]?)description(?:['"]?)\s*:/gi,
   ];
-  
+
+  const toolBlacklist = new Set(['type', 'name', 'string', 'object', 'number', 'boolean', 'array', 'required', 'description', 'default', 'null', 'true', 'false', 'none', 'test', 'self', 'args', 'kwargs', 'input', 'output', 'result', 'data', 'error', 'value', 'index', 'item', 'list', 'dict', 'set', 'map', 'key', 'url', 'env', 'config', 'options']);
+
   const toolSet = new Set();
-  for (const file of files) {
+  for (const file of mcpFiles) {
     for (const pattern of toolPatterns) {
       pattern.lastIndex = 0;
       let m;
       while ((m = pattern.exec(file.content)) !== null) {
         const name = m[1] || m[2];
-        if (name && name.length > 2 && name.length < 50 && !['type', 'name', 'string', 'object', 'number', 'boolean', 'array', 'required', 'description', 'default', 'null', 'true', 'false', 'none'].includes(name)) {
+        if (name && name.length > 2 && name.length < 50 && !toolBlacklist.has(name)) {
           toolSet.add(name);
         }
       }
@@ -1566,6 +1582,235 @@ function findMcpConfigs() {
   return found;
 }
 
+// ── Skill Discovery & Validation ─────────────────────────
+
+/**
+ * Parse YAML frontmatter from a SKILL.md file.
+ * Returns { meta: {...}, body: string, errors: string[] }
+ */
+function parseSkillFrontmatter(content) {
+  const errors = [];
+  const lines = content.split('\n');
+
+  // Must start with ---
+  if (lines[0].trim() !== '---') {
+    return { meta: null, body: content, errors: ['Missing YAML frontmatter (file must start with ---)'] };
+  }
+
+  // Find closing ---
+  let endIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === '---') { endIdx = i; break; }
+  }
+  if (endIdx === -1) {
+    return { meta: null, body: content, errors: ['Unclosed frontmatter (missing closing ---)'] };
+  }
+
+  // Parse YAML-like key: value pairs
+  const meta = {};
+  const yamlLines = lines.slice(1, endIdx);
+  for (let i = 0; i < yamlLines.length; i++) {
+    const line = yamlLines[i];
+    if (line.trim() === '' || line.trim().startsWith('#')) continue;
+
+    // Check for tabs
+    if (line.includes('\t')) {
+      errors.push(`Line ${i + 2}: Tab character found (use spaces)`);
+    }
+
+    const match = line.match(/^([a-z][a-z0-9_-]*):\s*(.*)/i);
+    if (!match) {
+      // Could be a continuation line (YAML multiline)
+      continue;
+    }
+    const key = match[1].toLowerCase();
+    let value = match[2].trim();
+
+    // Handle YAML lists on next lines
+    if (value === '' && i + 1 < yamlLines.length && yamlLines[i + 1].match(/^\s+-\s/)) {
+      const items = [];
+      let j = i + 1;
+      while (j < yamlLines.length && yamlLines[j].match(/^\s+-\s/)) {
+        items.push(yamlLines[j].replace(/^\s+-\s*/, '').trim());
+        j++;
+      }
+      value = items;
+    }
+
+    // Strip surrounding quotes
+    if (typeof value === 'string' && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+
+    meta[key] = value;
+  }
+
+  const body = lines.slice(endIdx + 1).join('\n').trim();
+  return { meta, body, errors };
+}
+
+/**
+ * Validate a parsed skill against the Claude Code SKILL.md spec.
+ * Returns { errors: [...], warnings: [...], info: {...} }
+ */
+function validateSkill(parsed) {
+  const { meta, body, errors: parseErrors } = parsed;
+  const errors = [...parseErrors];
+  const warnings = [];
+  const info = {};
+
+  if (!meta) return { errors, warnings, info };
+
+  // Known fields
+  const knownFields = new Set([
+    'name', 'description', 'allowed-tools', 'user-invocable', 'user-invokable',
+    'disable-model-invocation', 'license', 'metadata', 'argument-hint',
+    'compatibility', 'version', 'author',
+  ]);
+
+  // Check for unknown fields
+  for (const key of Object.keys(meta)) {
+    if (!knownFields.has(key)) {
+      warnings.push(`Unknown frontmatter field: "${key}"`);
+    }
+  }
+
+  // Required: name
+  if (!meta.name) {
+    errors.push('Missing required field: name');
+  } else {
+    info.name = meta.name;
+    if (meta.name.length > 64) errors.push(`name exceeds 64 chars (${meta.name.length})`);
+    if (/<[^>]+>/.test(meta.name)) errors.push('name contains XML/HTML tags');
+  }
+
+  // Required: description
+  if (!meta.description) {
+    errors.push('Missing required field: description');
+  } else {
+    info.description = typeof meta.description === 'string' ? meta.description.slice(0, 120) : String(meta.description).slice(0, 120);
+    if (typeof meta.description === 'string' && meta.description.length > 1024) {
+      warnings.push(`description is ${meta.description.length} chars (recommended max: 1024)`);
+    }
+    if (/<[^>]+>/.test(meta.description)) warnings.push('description contains XML/HTML tags');
+  }
+
+  // Security: allowed-tools
+  if (!meta['allowed-tools']) {
+    warnings.push('No allowed-tools set — skill has access to ALL tools (security risk)');
+    info.allowedTools = null;
+  } else {
+    const tools = typeof meta['allowed-tools'] === 'string'
+      ? meta['allowed-tools'].split(',').map(t => t.trim()).filter(Boolean)
+      : Array.isArray(meta['allowed-tools']) ? meta['allowed-tools'] : [];
+    info.allowedTools = tools;
+    // Check for wildcard/dangerous patterns
+    if (tools.some(t => t === '*' || t === 'Bash' || t === 'Bash(*)')) {
+      warnings.push('allowed-tools includes unrestricted Bash access');
+    }
+  }
+
+  // Boolean fields
+  for (const boolField of ['user-invocable', 'user-invokable', 'disable-model-invocation']) {
+    if (meta[boolField] !== undefined) {
+      const val = String(meta[boolField]).toLowerCase();
+      if (!['true', 'false'].includes(val)) {
+        errors.push(`${boolField} must be true or false (got: "${meta[boolField]}")`);
+      }
+    }
+  }
+
+  // Typo detection
+  if (meta['user-invokable'] && !meta['user-invocable']) {
+    warnings.push('Using "user-invokable" (known typo variant) — both spellings work');
+  }
+
+  // Body checks
+  if (body) {
+    const bodyLines = body.split('\n').length;
+    info.bodyLines = bodyLines;
+    if (bodyLines > 500) warnings.push(`Body is ${bodyLines} lines (recommended max: 500)`);
+
+    // Check for potential prompt injection patterns in body
+    const injectionPatterns = [
+      { pattern: /ignore\s+(all\s+)?previous\s+(instructions|rules)/i, label: 'Prompt injection pattern' },
+      { pattern: /<IMPORTANT>/i, label: 'Suspicious <IMPORTANT> tag' },
+      { pattern: /system\s*:\s*you\s+are/i, label: 'System prompt override attempt' },
+    ];
+    for (const { pattern, label } of injectionPatterns) {
+      if (pattern.test(body)) {
+        warnings.push(`${label} detected in body`);
+      }
+    }
+  }
+
+  // Extract MCP tool references
+  const mcpRefs = [];
+  const mcpPattern = /mcp__([a-z0-9_-]+)__([a-z0-9_]+)/gi;
+  const fullText = (meta.description || '') + ' ' + (typeof meta['allowed-tools'] === 'string' ? meta['allowed-tools'] : '') + ' ' + (body || '');
+  let mcpMatch;
+  while ((mcpMatch = mcpPattern.exec(fullText)) !== null) {
+    mcpRefs.push({ server: mcpMatch[1], tool: mcpMatch[2] });
+  }
+  info.mcpRefs = mcpRefs;
+
+  // Deduplicate MCP server names
+  info.mcpServers = [...new Set(mcpRefs.map(r => r.server))];
+
+  return { errors, warnings, info };
+}
+
+/**
+ * Find all SKILL.md files in known skill directories.
+ */
+function findSkills() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const cwd = process.cwd();
+  const found = [];
+
+  const skillDirs = [
+    // Global skill dirs
+    { name: 'Claude Code (global)', base: path.join(home, '.claude', 'skills') },
+    { name: 'Cursor (global)', base: path.join(home, '.cursor', 'skills') },
+    { name: 'Antigravity (global)', base: path.join(home, '.agent', 'skills') },
+    // Project-level skill dirs
+    { name: 'Claude Code (project)', base: path.join(cwd, '.claude', 'skills') },
+    { name: 'Cursor (project)', base: path.join(cwd, '.cursor', 'skills') },
+    { name: 'GitHub Skills (project)', base: path.join(cwd, '.github', 'skills') },
+    { name: 'Antigravity (project)', base: path.join(cwd, '.agent', 'skills') },
+  ];
+
+  for (const dir of skillDirs) {
+    if (!fs.existsSync(dir.base)) continue;
+    try {
+      const entries = fs.readdirSync(dir.base, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const skillPath = path.join(dir.base, entry.name, 'SKILL.md');
+        if (!fs.existsSync(skillPath)) continue;
+        try {
+          const content = fs.readFileSync(skillPath, 'utf8');
+          const parsed = parseSkillFrontmatter(content);
+          const validation = validateSkill(parsed);
+          found.push({
+            source: dir.name,
+            dir: path.join(dir.base, entry.name),
+            path: skillPath,
+            dirName: entry.name,
+            parsed,
+            validation,
+            isSymlink: entry.isSymbolicLink(),
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+
+  return found;
+}
+
+// ── Server Config Extraction ─────────────────────────────
+
 function extractServersFromConfig(config) {
   // Handle both { mcpServers: {...} } and { servers: {...} } formats
   const servers = config.mcpServers || config.servers || {};
@@ -1627,7 +1872,10 @@ function extractServersFromConfig(config) {
         }
       } catch {}
     }
-    
+
+    // Resolve local installation directory
+    info.localDir = resolveLocalDir(info);
+
     result.push(info);
   }
   return result;
@@ -1638,6 +1886,196 @@ function serverSlug(server) {
   if (server.npmPackage) return server.npmPackage.replace(/^@/, '').replace(/\//g, '-');
   if (server.pyPackage) return server.pyPackage.replace(/[^a-z0-9-]/gi, '-');
   return server.name.toLowerCase().replace(/[^a-z0-9-]/gi, '-');
+}
+
+/**
+ * Resolve the local installation directory for a discovered MCP server.
+ * Returns an absolute path or null if not found.
+ */
+function resolveLocalDir(server) {
+  const home = os.homedir();
+  const isWin = process.platform === 'win32';
+
+  // node /path/to/file → walk up to project root (package.json or .git)
+  const allArgs = [server.command, ...server.args].filter(Boolean).join(' ');
+  const nodePathMatch = allArgs.match(/node\s+["']?([^"'\s]+)/);
+  if (nodePathMatch) {
+    let dir = path.dirname(path.resolve(nodePathMatch[1]));
+    for (let i = 0; i < 5; i++) {
+      if (fs.existsSync(path.join(dir, 'package.json')) || fs.existsSync(path.join(dir, '.git'))) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    // Fallback: use the script's directory
+    return path.dirname(path.resolve(nodePathMatch[1]));
+  }
+
+  // python /path/to/file → same approach
+  const pyPathMatch = allArgs.match(/python[3]?\s+["']?([^"'\s]+\.py)/);
+  if (pyPathMatch) {
+    let dir = path.dirname(path.resolve(pyPathMatch[1]));
+    for (let i = 0; i < 5; i++) {
+      if (fs.existsSync(path.join(dir, 'pyproject.toml')) || fs.existsSync(path.join(dir, 'setup.py')) || fs.existsSync(path.join(dir, '.git'))) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return path.dirname(path.resolve(pyPathMatch[1]));
+  }
+
+  // npm/npx package → check global node_modules
+  if (server.npmPackage) {
+    const pkgName = server.npmPackage.replace(/@latest$/, '').replace(/@[\d.]+$/, '');
+    const candidates = [];
+    // Global npm
+    try {
+      const globalRoot = execFileSync('npm', ['root', '-g'], { timeout: 5000, stdio: 'pipe' }).toString().trim();
+      candidates.push(path.join(globalRoot, pkgName));
+    } catch {}
+    // Local node_modules (cwd)
+    candidates.push(path.join(process.cwd(), 'node_modules', pkgName));
+    for (const dir of candidates) {
+      if (fs.existsSync(dir)) return dir;
+    }
+  }
+
+  // uvx/pip package → check uv tools cache and site-packages
+  if (server.pyPackage) {
+    const pkgName = server.pyPackage.replace(/@latest$/, '').replace(/@[\d.]+$/, '');
+    const candidates = [];
+    if (isWin) {
+      const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+      candidates.push(path.join(localAppData, 'uv', 'tools', pkgName));
+    } else {
+      candidates.push(path.join(home, '.local', 'share', 'uv', 'tools', pkgName));
+    }
+    // Also try pip show
+    try {
+      const pipOut = execFileSync('pip', ['show', pkgName, '-f'], { timeout: 5000, stdio: 'pipe' }).toString();
+      const locMatch = pipOut.match(/Location:\s*(.+)/);
+      if (locMatch) {
+        const normalized = pkgName.replace(/-/g, '_');
+        const pkgDir = path.join(locMatch[1].trim(), normalized);
+        if (fs.existsSync(pkgDir)) candidates.push(pkgDir);
+      }
+    } catch {}
+    for (const dir of candidates) {
+      if (fs.existsSync(dir)) return dir;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Scan a local directory (like scanRepo but without cloning).
+ */
+async function scanLocalDir(localDir, serverName) {
+  const start = Date.now();
+  const slug = serverName.toLowerCase().replace(/[^a-z0-9-]/gi, '-');
+
+  if (!jsonMode) process.stdout.write(`${icons.scan}  Scanning ${c.bold}${slug}${c.reset} ${c.dim}(local)${c.reset} ${c.dim}...${c.reset}`);
+
+  // Collect files from local dir
+  const files = collectFiles(localDir);
+  if (files.length === 0) {
+    if (!jsonMode) process.stdout.write(`  ${c.yellow}no scannable files found${c.reset}\n`);
+    return null;
+  }
+
+  // Detect info
+  const info = detectPackageInfo(localDir, files);
+
+  // Quick checks
+  const findings = quickChecks(files);
+
+  // Registry lookup
+  const registryData = await checkRegistry(slug);
+
+  const duration = elapsed(start);
+
+  if (!jsonMode) {
+    process.stdout.write('\r\x1b[K');
+    printScanResult(`local://${localDir}`, info, files, findings, registryData, duration);
+  }
+
+  return { slug, url: `local://${localDir}`, info, files: files.length, findings, registryData, duration };
+}
+
+/**
+ * Download package source from PyPI or npm to a temp dir and scan it.
+ * Used as last resort when git clone fails and no local install exists.
+ */
+async function downloadAndScan(server) {
+  const start = Date.now();
+  const slug = server.name.toLowerCase().replace(/[^a-z0-9-]/gi, '-');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentaudit-pkg-'));
+
+  try {
+    if (server.pyPackage) {
+      const pkgName = server.pyPackage.replace(/@latest$/, '').replace(/@[\d.]+$/, '');
+      if (!jsonMode) process.stdout.write(`${icons.scan}  Downloading ${c.bold}${pkgName}${c.reset} ${c.dim}from PyPI...${c.reset}`);
+      // Download sdist/wheel without installing
+      execFileSync('pip', ['download', '--no-deps', '-d', tmpDir, pkgName], { timeout: 30000, stdio: 'pipe' });
+      // Extract any .tar.gz or .whl (zip) files
+      const downloaded = fs.readdirSync(tmpDir);
+      const extractDir = path.join(tmpDir, 'src');
+      fs.mkdirSync(extractDir, { recursive: true });
+      for (const f of downloaded) {
+        const fp = path.join(tmpDir, f);
+        if (f.endsWith('.whl') || f.endsWith('.zip')) {
+          execFileSync('python', ['-m', 'zipfile', '-e', fp, extractDir], { timeout: 10000, stdio: 'pipe' });
+        } else if (f.endsWith('.tar.gz') || f.endsWith('.tgz')) {
+          execFileSync('tar', ['xzf', fp, '-C', extractDir], { timeout: 10000, stdio: 'pipe' });
+        }
+      }
+      const files = collectFiles(extractDir);
+      if (files.length === 0) return null;
+      const info = detectPackageInfo(extractDir, files);
+      const findings = quickChecks(files);
+      const registryData = await checkRegistry(slug);
+      const duration = elapsed(start);
+      if (!jsonMode) {
+        process.stdout.write('\r\x1b[K');
+        printScanResult(`pypi://${pkgName}`, info, files, findings, registryData, duration);
+      }
+      return { slug, url: `pypi://${pkgName}`, info, files: files.length, findings, registryData, duration };
+    }
+
+    if (server.npmPackage) {
+      const pkgName = server.npmPackage.replace(/@latest$/, '').replace(/@[\d.]+$/, '');
+      if (!jsonMode) process.stdout.write(`${icons.scan}  Downloading ${c.bold}${pkgName}${c.reset} ${c.dim}from npm...${c.reset}`);
+      // npm pack downloads tarball without installing
+      execFileSync('npm', ['pack', pkgName, '--pack-destination', tmpDir], { timeout: 30000, stdio: 'pipe' });
+      const tarballs = fs.readdirSync(tmpDir).filter(f => f.endsWith('.tgz'));
+      if (tarballs.length === 0) return null;
+      const extractDir = path.join(tmpDir, 'src');
+      fs.mkdirSync(extractDir, { recursive: true });
+      execFileSync('tar', ['xzf', path.join(tmpDir, tarballs[0]), '-C', extractDir], { timeout: 10000, stdio: 'pipe' });
+      const files = collectFiles(extractDir);
+      if (files.length === 0) return null;
+      const info = detectPackageInfo(extractDir, files);
+      const findings = quickChecks(files);
+      const registryData = await checkRegistry(slug);
+      const duration = elapsed(start);
+      if (!jsonMode) {
+        process.stdout.write('\r\x1b[K');
+        printScanResult(`npm://${pkgName}`, info, files, findings, registryData, duration);
+      }
+      return { slug, url: `npm://${pkgName}`, info, files: files.length, findings, registryData, duration };
+    }
+  } catch (err) {
+    if (!jsonMode) {
+      process.stdout.write('\r\x1b[K');
+      process.stdout.write(`${icons.scan}  ${c.bold}${slug}${c.reset}  ${c.yellow}download failed${c.reset}\n`);
+      const msg = err.stderr?.toString().trim().split('\n')[0] || err.message?.split('\n')[0] || '';
+      if (msg) console.log(`    ${c.dim}${msg}${c.reset}`);
+    }
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+  return null;
 }
 
 async function searchGitHub(query) {
@@ -1822,14 +2260,17 @@ async function discoverCommand(options = {}) {
         const hasOfficial = regData.has_official_audit;
         console.log(`${branch}  ${c.bold}${server.name}${c.reset}    ${sourceLabel}`);
         console.log(`${pipe}  ${riskBadge(riskScore)}  ${hasOfficial ? `${c.green}✔ official${c.reset}  ` : ''}${c.dim}${REGISTRY_URL}/packages/${slug}${c.reset}`);
-        if (resolvedUrl) allServersWithUrls.push({ name: server.name, sourceUrl: resolvedUrl, hasAudit: true, regData });
+        if (resolvedUrl || server.localDir || server.pyPackage || server.npmPackage) allServersWithUrls.push({ name: server.name, sourceUrl: resolvedUrl, localDir: server.localDir, pyPackage: server.pyPackage, npmPackage: server.npmPackage, hasAudit: true, regData });
       } else {
         unauditedServers++;
         console.log(`${branch}  ${c.bold}${server.name}${c.reset}    ${sourceLabel}`);
         if (resolvedUrl) {
           console.log(`${pipe}  ${c.yellow}⚠ not audited${c.reset}  ${c.dim}Run: ${c.cyan}agentaudit audit ${resolvedUrl}${c.reset}`);
           unauditedWithUrls.push({ name: server.name, sourceUrl: resolvedUrl });
-          allServersWithUrls.push({ name: server.name, sourceUrl: resolvedUrl, hasAudit: false });
+          allServersWithUrls.push({ name: server.name, sourceUrl: resolvedUrl, localDir: server.localDir, pyPackage: server.pyPackage, npmPackage: server.npmPackage, hasAudit: false });
+        } else if (server.localDir || server.pyPackage || server.npmPackage) {
+          console.log(`${pipe}  ${c.yellow}⚠ not audited${c.reset}  ${c.dim}${server.localDir ? 'local install found' : 'package registry available'} — will scan${c.reset}`);
+          allServersWithUrls.push({ name: server.name, sourceUrl: null, localDir: server.localDir, pyPackage: server.pyPackage, npmPackage: server.npmPackage, hasAudit: false });
         } else {
           console.log(`${pipe}  ${c.yellow}⚠ not audited${c.reset}  ${c.dim}Source URL unknown — check the package's GitHub/npm page${c.reset}`);
         }
@@ -1854,29 +2295,115 @@ async function discoverCommand(options = {}) {
   }
   console.log();
   
-  // --scan: automatically scan all servers with resolved source URLs (git-cloneable only)
+  // ── Skill Discovery ──────────────────────────────────
+  const skills = findSkills();
+  if (skills.length > 0) {
+    console.log(sectionHeader(`Skills — ${skills.length} found`));
+    console.log();
+
+    // Group by source
+    const bySource = {};
+    for (const skill of skills) {
+      (bySource[skill.source] || (bySource[skill.source] = [])).push(skill);
+    }
+
+    for (const [source, sourceSkills] of Object.entries(bySource)) {
+      console.log(`${icons.bullet}  ${c.bold}${source}${c.reset}`);
+      console.log();
+
+      for (let i = 0; i < sourceSkills.length; i++) {
+        const skill = sourceSkills[i];
+        const isLast = i === sourceSkills.length - 1;
+        const branch = isLast ? icons.treeLast : icons.tree;
+        const pipe = isLast ? '   ' : `${icons.pipe}  `;
+        const { errors, warnings, info } = skill.validation;
+        const name = info.name || skill.dirName;
+        const hasErrors = errors.length > 0;
+        const hasWarnings = warnings.length > 0;
+
+        // Status indicator
+        let status;
+        if (hasErrors) status = `${c.red}✖ ${errors.length} error${errors.length !== 1 ? 's' : ''}${c.reset}`;
+        else if (hasWarnings) status = `${c.yellow}⚠ ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}${c.reset}`;
+        else status = `${c.green}✔ valid${c.reset}`;
+
+        console.log(`${branch}  ${c.bold}${name}${c.reset}    ${status}`);
+
+        // Description (truncated)
+        if (info.description) {
+          const desc = info.description.length > 70 ? info.description.slice(0, 67) + '...' : info.description;
+          console.log(`${pipe}  ${c.dim}${desc}${c.reset}`);
+        }
+
+        // MCP tool references
+        if (info.mcpServers && info.mcpServers.length > 0) {
+          const serverList = info.mcpServers.map(s => `${c.cyan}${s}${c.reset}`).join(', ');
+          console.log(`${pipe}  ${c.dim}uses MCP:${c.reset} ${serverList}`);
+        }
+
+        // Allowed tools summary
+        if (info.allowedTools === null) {
+          console.log(`${pipe}  ${c.yellow}⚠ no allowed-tools — unrestricted access${c.reset}`);
+        } else if (info.allowedTools && info.allowedTools.length > 0) {
+          const toolCount = info.allowedTools.length;
+          console.log(`${pipe}  ${c.dim}${toolCount} allowed tool${toolCount !== 1 ? 's' : ''}${c.reset}`);
+        }
+
+        // Show errors/warnings inline
+        if (hasErrors) {
+          for (const err of errors.slice(0, 3)) {
+            console.log(`${pipe}  ${c.red}  ✖ ${err}${c.reset}`);
+          }
+        }
+        if (hasWarnings && !hasErrors) {
+          for (const warn of warnings.slice(0, 2)) {
+            console.log(`${pipe}  ${c.yellow}  ⚠ ${warn}${c.reset}`);
+          }
+        }
+      }
+      console.log();
+    }
+  }
+
+  // --scan: automatically scan all servers (git clone + local fallback)
   if (autoScan) {
     const isCloneable = (url) => /^https?:\/\/(github\.com|gitlab\.com|bitbucket\.org)\//i.test(url);
-    const scanTargets = allServersWithUrls.filter(s => s.sourceUrl && isCloneable(s.sourceUrl));
-    // Deduplicate by sourceUrl
+    // Include servers that are cloneable OR have a local dir OR a known package
+    const scanTargets = allServersWithUrls.filter(s =>
+      (s.sourceUrl && isCloneable(s.sourceUrl)) || s.localDir || s.pyPackage || s.npmPackage
+    );
+    // Deduplicate by sourceUrl or localDir
     const seen = new Set();
     const dedupedTargets = scanTargets.filter(s => {
-      if (seen.has(s.sourceUrl)) return false;
-      seen.add(s.sourceUrl);
+      const key = (s.sourceUrl && isCloneable(s.sourceUrl)) ? s.sourceUrl : s.localDir;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
       return true;
     });
-    const skipped = allServersWithUrls.filter(s => s.sourceUrl && !isCloneable(s.sourceUrl));
+    const skippedCount = allServersWithUrls.length - scanTargets.length;
     if (dedupedTargets.length > 0) {
       console.log(sectionHeader(`Auto-scanning ${dedupedTargets.length} server${dedupedTargets.length !== 1 ? 's' : ''}`));
       console.log(`  ${c.bold}${icons.scan}  Starting scans...${c.reset}`);
-      if (skipped.length > 0) {
-        console.log(`  ${c.dim}(${skipped.length} skipped — no cloneable source URL)${c.reset}`);
+      if (skippedCount > 0) {
+        console.log(`  ${c.dim}(${skippedCount} skipped — remote-only, no local source)${c.reset}`);
       }
       console.log();
-      
+
       const scanResults = [];
       for (const target of dedupedTargets) {
-        const result = await scanRepo(target.sourceUrl);
+        let result = null;
+        // Try git clone first if URL is cloneable
+        if (target.sourceUrl && isCloneable(target.sourceUrl)) {
+          result = await scanRepo(target.sourceUrl);
+        }
+        // Fallback 1: scan local installation
+        if (!result && target.localDir) {
+          result = await scanLocalDir(target.localDir, target.name);
+        }
+        // Fallback 2: download from PyPI/npm and scan
+        if (!result && (target.pyPackage || target.npmPackage)) {
+          result = await downloadAndScan(target);
+        }
         if (result) scanResults.push({ ...result, serverName: target.name });
       }
       
@@ -1969,7 +2496,7 @@ async function discoverCommand(options = {}) {
   }
   
   if (!autoScan && !interactiveAudit && !jsonMode) {
-    console.log(`  ${c.dim}Looking for general package scanning? Try ${c.cyan}pip audit${c.dim} or ${c.cyan}npm audit${c.dim}.${c.reset}`);
+    console.log(`  ${c.dim}Run ${c.cyan}agentaudit discover --quick${c.dim} to auto-scan all servers${c.reset}`);
     console.log();
   }
 }
@@ -2594,20 +3121,22 @@ function renderBenchmarkTab(data, width) {
   lines.push(`  ${c.bold}${fmtNum(benchmark.models.length)}${c.reset} models ${c.dim}│${c.reset} ${c.bold}${fmtNum(overview.total_reports || 0)}${c.reset} audits ${c.dim}│${c.reset} ${c.bold}${fmtNum(overview.total_findings || 0)}${c.reset} findings`);
   lines.push('');
 
-  // Header
-  const nameW = 28;
-  const hdr = `  ${padRight(`${c.bold}Model${c.reset}`, nameW + 9)}  ${padRight('Audits', 7)} ${padRight('Risk', 5)} ${padRight('Detection', 16)}  Severity`;
-  lines.push(hdr);
+  // Header — fixed column widths for alignment
+  const nameW = 30;
+  const auditsW = 6;
+  const riskW = 5;
+  const hdr = `  ${padRight('Model', nameW)}  ${padLeft('Audits', auditsW)}  ${padLeft('Risk', riskW)}  ${'Detection'.padEnd(14)}  Severity`;
+  lines.push(`  ${c.bold}${stripAnsi(hdr).trim()}${c.reset}`);
   lines.push(`  ${c.dim}${'─'.repeat(Math.min(width - 4, 86))}${c.reset}`);
 
   for (const m of benchmark.models) {
     const name = (m.audit_model || 'unknown').slice(0, nameW - 2);
-    const audits = padLeft(fmtNum(m.total_audits), 5);
+    const audits = padLeft(fmtNum(m.total_audits), auditsW);
     const riskVal = parseFloat(m.avg_risk_score) || 0;
     const riskColor = riskVal <= 20 ? c.green : riskVal <= 40 ? c.yellow : c.red;
-    const risk = `${riskColor}${padLeft(String(Math.round(riskVal)), 3)}${c.reset}`;
+    const risk = `${riskColor}${padLeft(String(Math.round(riskVal)), riskW)}${c.reset}`;
     const detection = renderGauge(m.detection_rate || 0, 100, 10);
-    // Severity as compact text instead of dots
+    // Severity as compact text
     const sev = m.severity_breakdown || {};
     const sevParts = [];
     if (sev.critical) sevParts.push(`${c.red}${sev.critical}C${c.reset}`);
@@ -2615,7 +3144,7 @@ function renderBenchmarkTab(data, width) {
     if (sev.medium) sevParts.push(`${c.yellow}${sev.medium}M${c.reset}`);
     if (sev.low) sevParts.push(`${c.blue}${sev.low}L${c.reset}`);
     const sevStr = sevParts.length > 0 ? sevParts.join(' ') : `${c.dim}—${c.reset}`;
-    lines.push(`  ${padRight(name, nameW)} ${audits}  ${risk}  ${detection}  ${sevStr}`);
+    lines.push(`  ${padRight(name, nameW)}  ${audits}  ${risk}  ${detection}  ${sevStr}`);
   }
 
   // Vulnerability landscape
@@ -3553,9 +4082,10 @@ async function main() {
     console.log(`    agentaudit <command> [options]`);
     console.log();
     console.log(`  ${c.bold}SCAN & AUDIT${c.reset}`);
-    console.log(`    ${c.cyan}discover${c.reset}              Find MCP servers in your AI editors`);
+    console.log(`    ${c.cyan}discover${c.reset}              Find MCP servers & skills in your AI tools`);
     console.log(`    ${c.cyan}scan${c.reset} <url> [url...]   Quick static scan (regex, ~2s)`);
     console.log(`    ${c.cyan}audit${c.reset} <url> [url...]  Deep LLM-powered security audit (~30s)`);
+    console.log(`    ${c.cyan}validate${c.reset} [path]       Validate SKILL.md format & security`);
     console.log(`    ${c.cyan}lookup${c.reset} <name>         Look up package in registry`);
     console.log();
     console.log(`  ${c.bold}COMMUNITY${c.reset}`);
@@ -3988,6 +4518,124 @@ async function main() {
     return;
   }
   
+  if (command === 'validate') {
+    const paths = targets.filter(t => !t.startsWith('--'));
+
+    // If no path given, find all skills and validate them
+    if (paths.length === 0) {
+      const skills = findSkills();
+      if (skills.length === 0) {
+        console.log(`  ${c.yellow}No SKILL.md files found${c.reset}`);
+        console.log(`  ${c.dim}Searched: ~/.claude/skills/, ~/.cursor/skills/, .claude/skills/, .cursor/skills/${c.reset}`);
+        console.log();
+        console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit validate [path/to/SKILL.md]${c.reset}`);
+        return;
+      }
+
+      console.log(`  ${c.bold}Validating ${skills.length} skill${skills.length !== 1 ? 's' : ''}${c.reset}`);
+      console.log();
+
+      let totalErrors = 0;
+      let totalWarnings = 0;
+
+      for (const skill of skills) {
+        const { errors, warnings, info } = skill.validation;
+        totalErrors += errors.length;
+        totalWarnings += warnings.length;
+
+        const name = info.name || skill.dirName;
+        const hasErrors = errors.length > 0;
+        const hasWarnings = warnings.length > 0;
+
+        if (hasErrors) {
+          console.log(`  ${c.red}✖${c.reset} ${c.bold}${name}${c.reset}  ${c.dim}${skill.path}${c.reset}`);
+          for (const err of errors) console.log(`    ${c.red}✖ ${err}${c.reset}`);
+          for (const warn of warnings) console.log(`    ${c.yellow}⚠ ${warn}${c.reset}`);
+        } else if (hasWarnings) {
+          console.log(`  ${c.yellow}⚠${c.reset} ${c.bold}${name}${c.reset}  ${c.dim}${skill.path}${c.reset}`);
+          for (const warn of warnings) console.log(`    ${c.yellow}⚠ ${warn}${c.reset}`);
+        } else {
+          console.log(`  ${c.green}✔${c.reset} ${c.bold}${name}${c.reset}  ${c.dim}${skill.path}${c.reset}`);
+        }
+
+        // Show MCP references
+        if (info.mcpServers && info.mcpServers.length > 0) {
+          console.log(`    ${c.dim}MCP servers: ${info.mcpServers.join(', ')}${c.reset}`);
+        }
+        if (info.allowedTools === null) {
+          console.log(`    ${c.yellow}⚠ no allowed-tools — unrestricted tool access${c.reset}`);
+        }
+        console.log();
+      }
+
+      // Summary
+      console.log(sectionHeader('Validation Summary'));
+      console.log();
+      if (totalErrors === 0 && totalWarnings === 0) {
+        console.log(`  ${c.green}✔ All ${skills.length} skills valid${c.reset}`);
+      } else {
+        if (totalErrors > 0) console.log(`  ${c.red}✖ ${totalErrors} error${totalErrors !== 1 ? 's' : ''}${c.reset}`);
+        if (totalWarnings > 0) console.log(`  ${c.yellow}⚠ ${totalWarnings} warning${totalWarnings !== 1 ? 's' : ''}${c.reset}`);
+      }
+      console.log();
+
+      if (jsonMode) {
+        console.log(JSON.stringify(skills.map(s => ({
+          name: s.validation.info.name || s.dirName,
+          path: s.path,
+          source: s.source,
+          errors: s.validation.errors,
+          warnings: s.validation.warnings,
+          mcpServers: s.validation.info.mcpServers,
+          allowedTools: s.validation.info.allowedTools,
+        })), null, 2));
+      }
+
+      process.exitCode = totalErrors > 0 ? 1 : 0;
+      return;
+    }
+
+    // Validate specific file(s)
+    for (const p of paths) {
+      const resolved = path.resolve(p);
+      if (!fs.existsSync(resolved)) {
+        console.log(`  ${c.red}✖ File not found: ${p}${c.reset}`);
+        process.exitCode = 1;
+        continue;
+      }
+
+      const content = fs.readFileSync(resolved, 'utf8');
+      const parsed = parseSkillFrontmatter(content);
+      const { errors, warnings, info } = validateSkill(parsed);
+      const name = info.name || path.basename(path.dirname(resolved));
+
+      console.log(`  ${c.bold}${name}${c.reset}  ${c.dim}${resolved}${c.reset}`);
+      console.log();
+
+      if (errors.length === 0 && warnings.length === 0) {
+        console.log(`  ${c.green}✔ Valid skill format${c.reset}`);
+      }
+
+      for (const err of errors) console.log(`  ${c.red}✖ ${err}${c.reset}`);
+      for (const warn of warnings) console.log(`  ${c.yellow}⚠ ${warn}${c.reset}`);
+
+      if (info.name) console.log(`  ${c.dim}name:${c.reset} ${info.name}`);
+      if (info.description) console.log(`  ${c.dim}description:${c.reset} ${info.description.slice(0, 80)}${info.description.length > 80 ? '...' : ''}`);
+      if (info.allowedTools) console.log(`  ${c.dim}allowed-tools:${c.reset} ${info.allowedTools.join(', ')}`);
+      else if (info.allowedTools === null) console.log(`  ${c.yellow}allowed-tools: none (unrestricted)${c.reset}`);
+      if (info.mcpServers?.length > 0) console.log(`  ${c.dim}MCP servers:${c.reset} ${info.mcpServers.join(', ')}`);
+      if (info.bodyLines) console.log(`  ${c.dim}body:${c.reset} ${info.bodyLines} lines`);
+      console.log();
+
+      if (jsonMode) {
+        console.log(JSON.stringify({ name: info.name, path: resolved, errors, warnings, info }, null, 2));
+      }
+
+      process.exitCode = errors.length > 0 ? 1 : 0;
+    }
+    return;
+  }
+
   if (command === 'discover') {
     const scanFlag = targets.includes('--quick') || targets.includes('--scan') || targets.includes('-s');
     const auditFlag = targets.includes('--deep') || targets.includes('--audit') || targets.includes('-a');
