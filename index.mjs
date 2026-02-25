@@ -343,7 +343,7 @@ async function checkRegistry(slug) {
 // ── MCP Server ───────────────────────────────────────────
 
 const server = new Server(
-  { name: 'agentaudit', version: '3.12.1' },
+  { name: 'agentaudit', version: '3.12.2' },
   { capabilities: { tools: {} } }
 );
 

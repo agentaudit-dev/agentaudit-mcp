@@ -150,6 +150,36 @@ const USER_CRED_DIR = path.join(xdgConfig, 'agentaudit');
 const USER_CRED_FILE = path.join(USER_CRED_DIR, 'credentials.json');
 const SKILL_CRED_FILE = path.join(SKILL_DIR, 'config', 'credentials.json');
 const PROFILE_CACHE_FILE = path.join(USER_CRED_DIR, 'profile-cache.json');
+const HISTORY_DIR = path.join(USER_CRED_DIR, 'history');
+
+function saveHistory(report) {
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    const slug = report.skill_slug || 'unknown';
+    const model = (report.audit_model || 'unknown').replace(/[^a-z0-9-]/gi, '-').slice(0, 30);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `${ts}_${slug}_${model}.json`;
+    fs.writeFileSync(path.join(HISTORY_DIR, filename), JSON.stringify(report, null, 2));
+  } catch {}
+}
+
+function loadHistory(limit = 20) {
+  try {
+    if (!fs.existsSync(HISTORY_DIR)) return [];
+    const files = fs.readdirSync(HISTORY_DIR)
+      .filter(f => f.endsWith('.json'))
+      .sort()
+      .reverse()
+      .slice(0, limit);
+    return files.map(f => {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, f), 'utf8'));
+        data._file = f;
+        return data;
+      } catch { return null; }
+    }).filter(Boolean);
+  } catch { return []; }
+}
 
 function loadCredentials() {
   for (const f of [SKILL_CRED_FILE, USER_CRED_FILE]) {
@@ -220,6 +250,37 @@ function resolveProvider() {
 
   // Fallback: first match wins
   return LLM_PROVIDERS.find(p => process.env[p.key]) || null;
+}
+
+function resolveModel(modelName) {
+  // model with '/' → OpenRouter
+  if (modelName.includes('/')) {
+    const p = LLM_PROVIDERS.find(p => p.provider === 'openrouter' && process.env[p.key]);
+    if (p) return { ...p, model: modelName };
+    return null;
+  }
+  // Known prefix → native provider
+  const prefixes = [
+    ['claude', 'anthropic'], ['gemini', 'google'], ['gpt', 'openai'],
+    ['deepseek', 'deepseek'], ['mistral', 'mistral'], ['grok', 'xai'], ['glm', 'zhipu'],
+  ];
+  for (const [prefix, prov] of prefixes) {
+    if (modelName.toLowerCase().startsWith(prefix)) {
+      const p = LLM_PROVIDERS.find(p => p.provider === prov && process.env[p.key]);
+      if (p) return { ...p, model: modelName };
+    }
+  }
+  // Check PROVIDER_MODELS for exact match
+  for (const [prov, models] of Object.entries(PROVIDER_MODELS)) {
+    if (models.some(m => m.value === modelName)) {
+      const p = LLM_PROVIDERS.find(p => p.provider === prov && process.env[p.key]);
+      if (p) return { ...p, model: modelName };
+    }
+  }
+  // Last resort: OpenRouter
+  const or = LLM_PROVIDERS.find(p => p.provider === 'openrouter' && process.env[p.key]);
+  if (or) return { ...or, model: modelName };
+  return null;
 }
 
 function saveCredentials(data) {
@@ -2509,6 +2570,91 @@ function loadAuditPrompt() {
   return null;
 }
 
+async function callLlm(llmConfig, systemPrompt, userMessage) {
+  const apiKey = process.env[llmConfig.key];
+  if (!apiKey) return { error: `Missing API key: ${llmConfig.key}` };
+  const start = Date.now();
+  let _text = '';
+  try {
+    let data;
+    if (llmConfig.type === 'anthropic') {
+      const res = await fetch(llmConfig.url, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: 8192, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      data = await res.json();
+      if (data.error) {
+        const friendly = formatApiError(data.error, llmConfig.provider, res.status);
+        return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
+      }
+      _text = data.content?.[0]?.text || '';
+      const report = extractJSON(_text);
+      if (report) {
+        report.audit_model = data.model || llmConfig.model;
+        report.audit_provider = llmConfig.provider;
+        if (data.id) report.provider_msg_id = data.id;
+        if (data.usage) { report.input_tokens = data.usage.input_tokens; report.output_tokens = data.usage.output_tokens; }
+      }
+      return { report, text: _text, duration: Date.now() - start };
+    } else if (llmConfig.type === 'gemini') {
+      const res = await fetch(`${llmConfig.url}/${llmConfig.model}:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          generationConfig: { maxOutputTokens: 8192 },
+        }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      data = await res.json();
+      if (data.error) {
+        const friendly = formatApiError(data.error, llmConfig.provider, res.status);
+        return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
+      }
+      _text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const report = extractJSON(_text);
+      if (report) {
+        report.audit_model = data.modelVersion || llmConfig.model;
+        report.audit_provider = llmConfig.provider;
+        if (data.usageMetadata) { report.input_tokens = data.usageMetadata.promptTokenCount; report.output_tokens = data.usageMetadata.candidatesTokenCount; }
+      }
+      return { report, text: _text, duration: Date.now() - start };
+    } else {
+      const headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+      if (llmConfig.provider === 'openrouter') { headers['HTTP-Referer'] = 'https://agentaudit.dev'; headers['X-Title'] = 'AgentAudit CLI'; }
+      const res = await fetch(llmConfig.url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: 8192, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      data = await res.json();
+      if (data.error) {
+        const friendly = formatApiError(data.error, llmConfig.provider, res.status);
+        return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
+      }
+      _text = data.choices?.[0]?.message?.content || '';
+      const report = extractJSON(_text);
+      if (report) {
+        report.audit_model = data.model || llmConfig.model;
+        report.audit_provider = llmConfig.provider;
+        if (data.id) report.provider_msg_id = data.id;
+        if (data.system_fingerprint) report.provider_fingerprint = data.system_fingerprint;
+        if (data.usage) { report.input_tokens = data.usage.prompt_tokens; report.output_tokens = data.usage.completion_tokens; }
+      }
+      return { report, text: _text, duration: Date.now() - start };
+    }
+  } catch (err) {
+    const dur = Date.now() - start;
+    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) return { error: 'Request timed out (120s)', hint: 'Try again or use a faster model', duration: dur };
+    if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.message?.includes('fetch failed')) return { error: `Network error: could not reach ${llmConfig.provider}`, hint: 'Check your internet connection', duration: dur };
+    return { error: err.message, duration: dur };
+  }
+}
+
 async function auditRepo(url) {
   const start = Date.now();
   const slug = slugFromUrl(url);
@@ -2547,72 +2693,24 @@ async function auditRepo(url) {
   }
   console.log(` ${c.green}done${c.reset}`);
   
-  // Step 4: LLM Analysis
-  // Resolve provider: preferred_provider from config → first match fallback
-  const activeLlm = resolveProvider();
-  const llmApiKey = activeLlm ? process.env[activeLlm.key] : null;
-  const activeProvider = activeLlm ? activeLlm.name : null;
+  // Step 4: Provenance + type detection (needs repoPath on disk)
+  let commitSha = '';
+  try { commitSha = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim(); } catch {}
+  const sourceHash = crypto.createHash('sha256').update(
+    files.slice().sort((a, b) => a.path.localeCompare(b.path))
+      .map(f => f.path + '\n' + f.content).join('\n')
+  ).digest('hex');
+  const pkgInfo = detectPackageInfo(repoPath, files);
+  const KNOWN_MCP_LIBS = new Set(['fastmcp', 'jlowin-fastmcp', 'mcp-go', 'fastapi-mcp', 'fastapi_mcp', 'mcp-use', 'mcp-agent']);
+  const KNOWN_CLI = new Set(['mcp-cli', 'mcp-scan', 'inspector']);
+  let detectedType = pkgInfo.type === 'unknown' ? 'other' : pkgInfo.type;
+  if (KNOWN_MCP_LIBS.has(slug)) detectedType = 'library';
+  if (KNOWN_CLI.has(slug)) detectedType = 'cli-tool';
 
-  // Model override: --model flag > AGENTAUDIT_MODEL env > credentials.json > provider default
-  const modelArgIdx = process.argv.indexOf('--model');
-  const modelFlag = modelArgIdx !== -1 ? process.argv[modelArgIdx + 1] : null;
-  const modelEnv = process.env.AGENTAUDIT_MODEL;
-  const modelConfig = loadLlmConfig()?.llm_model;
-  const modelOverride = modelFlag || modelEnv || modelConfig || null;
-  if (activeLlm && modelOverride) {
-    activeLlm.model = modelOverride;
-  }
-  
-  if (!activeLlm) {
-    // No LLM API key — compact explanation
-    console.log();
-    console.log(`  ${c.yellow}No LLM API key found.${c.reset} The ${c.bold}audit${c.reset} command needs an LLM to analyze code.`);
-    console.log();
-    console.log(`  ${c.bold}Set an API key${c.reset} (e.g. ${c.cyan}export OPENROUTER_API_KEY=sk-or-...${c.reset})`);
-    console.log(`  ${c.dim}Run "agentaudit model" to configure provider + model interactively${c.reset}`);
-    console.log();
-    console.log(`  ${c.bold}Or export for manual review:${c.reset} ${c.cyan}agentaudit audit ${url} --export${c.reset}`);
-    console.log(`  ${c.bold}Or use as MCP server${c.reset} in Cursor/Claude ${c.dim}(no extra API key needed)${c.reset}`);
-    console.log(`  ${c.dim}{ "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } }${c.reset}`);
-    console.log();
-    
-    // Check if --export flag
-    if (process.argv.includes('--export')) {
-      const exportPath = path.join(process.cwd(), `audit-${slug}.md`);
-      const exportContent = [
-        `# Security Audit: ${slug}`,
-        `**Source:** ${url}`,
-        `**Files:** ${files.length}`,
-        ``,
-        `## Audit Instructions`,
-        ``,
-        auditPrompt || '(audit prompt not found)',
-        ``,
-        `## Report Format`,
-        ``,
-        `After analysis, produce a JSON report:`,
-        '```json',
-        `{ "skill_slug": "${slug}", "source_url": "${url}", "risk_score": 0, "result": "safe", "findings": [] }`,
-        '```',
-        ``,
-        `## Source Code`,
-        ``,
-        codeBlock,
-      ].join('\n');
-      fs.writeFileSync(exportPath, exportContent);
-      console.log(`  ${icons.safe}  Exported to ${c.bold}${exportPath}${c.reset}`);
-      console.log(`  ${c.dim}Paste this into any LLM (Claude, ChatGPT, etc.) for analysis${c.reset}`);
-    }
-    
-    // Cleanup
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    return null;
-  }
-  
-  // We have an API key — run LLM audit
-  const modelLabel = modelOverride ? `${activeProvider} → ${activeLlm.model}` : activeProvider;
-  process.stdout.write(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${modelLabel})${c.reset}...`);
+  // Cleanup repo (files in memory, provenance captured)
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
 
+  // Build prompts
   const systemPrompt = auditPrompt || 'You are a security auditor. Analyze the code and report findings as JSON.';
   const userMessage = [
     `Audit this package: **${slug}** (${url})`,
@@ -2628,205 +2726,278 @@ async function auditRepo(url) {
     codeBlock,
   ].join('\n');
 
-  let report = null;
-  let _lastLlmText = '';
+  // Helper: add provenance to a report
+  const enrichReport = (report, duration) => {
+    report.skill_slug = slug;
+    report.package_type = detectedType;
+    report.audit_duration_ms = duration || (Date.now() - start);
+    report.files_scanned = files.length;
+    if (commitSha) report.commit_sha = commitSha;
+    report.source_hash = sourceHash;
+  };
 
-  try {
-    let data;
-    if (activeLlm.type === 'anthropic') {
-      // Anthropic Messages API (unique format)
-      const res = await fetch(activeLlm.url, {
+  // Helper: upload one report
+  const uploadReport = async (report, creds) => {
+    if (!creds) return;
+    process.stdout.write(`  Uploading report${report.audit_model ? ` (${report.audit_model})` : ''}...`);
+    try {
+      const res = await fetch(`${REGISTRY_URL}/api/reports`, {
         method: 'POST',
-        headers: {
-          'x-api-key': llmApiKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: activeLlm.model,
-          max_tokens: 8192,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userMessage }],
-        }),
-        signal: AbortSignal.timeout(120_000),
+        headers: { 'Authorization': `Bearer ${creds.api_key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(report),
+        signal: AbortSignal.timeout(15_000),
       });
-      data = await res.json();
-      if (data.error) {
-        console.log(` ${c.red}failed${c.reset}`);
-        const friendly = formatApiError(data.error, activeLlm.provider, res.status);
-        if (friendly) {
-          console.log(`  ${c.red}${friendly.text}${c.reset}`);
-          console.log(`  ${c.dim}${friendly.hint}${c.reset}`);
-        } else {
-          console.log(`  ${c.red}API error: ${data.error.message || JSON.stringify(data.error)}${c.reset}`);
-        }
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-        return null;
+      if (res.ok) {
+        console.log(` ${c.green}done${c.reset}`);
+      } else {
+        let errBody = ''; try { errBody = await res.text(); } catch {}
+        console.log(` ${c.yellow}failed (HTTP ${res.status})${c.reset}`);
+        if (errBody && process.argv.includes('--debug')) console.log(`  ${c.dim}Server: ${errBody.slice(0, 300)}${c.reset}`);
       }
-      _lastLlmText = data.content?.[0]?.text || '';
-      report = extractJSON(_lastLlmText);
-      if (report) {
-        report.audit_model = data.model || activeLlm.model;
-        report.audit_provider = activeLlm.provider;
-        if (data.id) report.provider_msg_id = data.id;
-        if (data.usage) {
-          report.input_tokens = data.usage.input_tokens;
-          report.output_tokens = data.usage.output_tokens;
+    } catch { console.log(` ${c.yellow}failed${c.reset}`); }
+  };
+
+  // Step 5: Resolve models
+  const modelsArgIdx = process.argv.indexOf('--models');
+  const modelsFlag = modelsArgIdx !== -1 ? process.argv[modelsArgIdx + 1] : null;
+  const modelNames = modelsFlag ? modelsFlag.split(',').map(m => m.trim()).filter(Boolean) : [];
+  const isMultiModel = modelNames.length > 1;
+
+  // ── Multi-Model Path ─────────────────────────────────────
+  if (isMultiModel) {
+    const resolvedModels = [];
+    const failedModels = [];
+    for (const name of modelNames) {
+      const config = resolveModel(name);
+      if (!config) { failedModels.push(name); continue; }
+      resolvedModels.push({ name, config });
+    }
+
+    if (resolvedModels.length === 0) {
+      console.log();
+      console.log(`  ${c.red}No API keys available for requested models${c.reset}`);
+      for (const name of failedModels) console.log(`    ${c.dim}${name}: no matching API key${c.reset}`);
+      console.log(`  ${c.dim}Run "agentaudit model" to configure providers${c.reset}`);
+      return null;
+    }
+
+    // Progress
+    const totalSteps = resolvedModels.length;
+    console.log(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${totalSteps} models in parallel)${c.reset}`);
+    if (failedModels.length > 0) {
+      for (const name of failedModels) console.log(`    ${c.yellow}⚠${c.reset} ${name.padEnd(30)} ${c.dim}skipped (no API key)${c.reset}`);
+    }
+
+    // Parallel LLM calls
+    const results = await Promise.allSettled(
+      resolvedModels.map(async ({ name, config }) => {
+        const result = await callLlm(config, systemPrompt, userMessage);
+        return { name, ...result };
+      })
+    );
+
+    // Process results
+    const reports = [];
+    for (let i = 0; i < results.length; i++) {
+      const name = resolvedModels[i].name;
+      const r = results[i];
+      if (r.status === 'rejected') {
+        console.log(`    ${c.red}✗${c.reset} ${name.padEnd(30)} ${c.red}error${c.reset}`);
+        continue;
+      }
+      const { report, text, error, hint, duration } = r.value;
+      if (error) {
+        console.log(`    ${c.red}✗${c.reset} ${name.padEnd(30)} ${c.red}${error}${c.reset}`);
+        if (hint) console.log(`      ${c.dim}${hint}${c.reset}`);
+        continue;
+      }
+      if (!report) {
+        console.log(`    ${c.yellow}✗${c.reset} ${name.padEnd(30)} ${c.yellow}JSON parse failed${c.reset}`);
+        if (process.argv.includes('--debug') && text) {
+          console.log(`      ${c.dim}${text.slice(0, 200)}...${c.reset}`);
+        }
+        continue;
+      }
+      const durSec = Math.round((duration || 0) / 1000);
+      console.log(`    ${c.green}✓${c.reset} ${name.padEnd(30)} ${c.green}done${c.reset} ${c.dim}(${durSec}s)${c.reset}`);
+      enrichReport(report, duration);
+      saveHistory(report);
+      reports.push({ name, report });
+    }
+
+    if (reports.length === 0) {
+      console.log();
+      console.log(`  ${c.red}No models returned valid results${c.reset}`);
+      return null;
+    }
+
+    // Display per-model results
+    console.log();
+    for (const { name, report } of reports) {
+      console.log(sectionHeader(name));
+      console.log(`  ${riskBadge(report.risk_score || 0)}`);
+      const fc = report.findings?.length || 0;
+      if (fc > 0) {
+        const counts = {};
+        for (const f of report.findings) { const s = (f.severity || 'info').toLowerCase(); counts[s] = (counts[s] || 0) + 1; }
+        const parts = [];
+        for (const sev of ['critical', 'high', 'medium', 'low', 'info']) { if (counts[sev]) parts.push(`${counts[sev]} ${sev}`); }
+        console.log(`  ${c.dim}${fc} findings: ${parts.join(', ')}${c.reset}`);
+      } else {
+        console.log(`  ${c.green}No findings${c.reset}`);
+      }
+      console.log();
+    }
+
+    // Consensus comparison
+    if (reports.length > 1) {
+      console.log(sectionHeader('Consensus'));
+
+      // Risk range
+      const risks = reports.map(r => r.report.risk_score || 0);
+      const minRisk = Math.min(...risks);
+      const maxRisk = Math.max(...risks);
+      const avgRisk = Math.round(risks.reduce((a, b) => a + b, 0) / risks.length);
+      console.log(`  Risk: ${riskBadge(avgRisk)} ${c.dim}(range ${minRisk}–${maxRisk})${c.reset}`);
+      console.log();
+
+      // Severity agreement
+      const severities = reports.map(r => (r.report.max_severity || 'none').toLowerCase());
+      const allSameSev = severities.every(s => s === severities[0]);
+      if (allSameSev) {
+        console.log(`  ${c.green}${reports.length}/${reports.length} models agree:${c.reset} ${severities[0].toUpperCase()}`);
+      } else {
+        console.log(`  ${c.yellow}Models disagree on severity:${c.reset}`);
+        for (const { name, report } of reports) {
+          const sev = (report.max_severity || 'none').toUpperCase();
+          const sc = severityColor(report.max_severity);
+          console.log(`    ${sc}${sev.padEnd(10)}${c.reset} ${c.dim}${name}${c.reset}`);
         }
       }
-    } else if (activeLlm.type === 'gemini') {
-      // Google Gemini API (unique format)
-      const res = await fetch(`${activeLlm.url}/${activeLlm.model}:generateContent?key=${llmApiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          generationConfig: { maxOutputTokens: 8192 },
-        }),
-        signal: AbortSignal.timeout(120_000),
-      });
-      data = await res.json();
-      if (data.error) {
-        console.log(` ${c.red}failed${c.reset}`);
-        const friendly = formatApiError(data.error, activeLlm.provider, res.status);
-        if (friendly) {
-          console.log(`  ${c.red}${friendly.text}${c.reset}`);
-          console.log(`  ${c.dim}${friendly.hint}${c.reset}`);
-        } else {
-          console.log(`  ${c.red}API error: ${data.error.message || JSON.stringify(data.error)}${c.reset}`);
-        }
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-        return null;
-      }
-      _lastLlmText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      report = extractJSON(_lastLlmText);
-      if (report) {
-        report.audit_model = data.modelVersion || activeLlm.model;
-        report.audit_provider = activeLlm.provider;
-        if (data.usageMetadata) {
-          report.input_tokens = data.usageMetadata.promptTokenCount;
-          report.output_tokens = data.usageMetadata.candidatesTokenCount;
+      console.log();
+
+      // Finding intersection (match by normalized title)
+      const findingsByTitle = new Map();
+      for (const { name, report } of reports) {
+        for (const f of (report.findings || [])) {
+          const key = (f.title || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          if (!key) continue;
+          if (!findingsByTitle.has(key)) findingsByTitle.set(key, { title: f.title, severity: f.severity, models: [] });
+          findingsByTitle.get(key).models.push(name);
         }
       }
-    } else {
-      // OpenAI-compatible API (OpenAI, Mistral, Groq, OpenRouter, etc.)
-      const headers = {
-        'Authorization': `Bearer ${llmApiKey}`,
-        'Content-Type': 'application/json',
-      };
-      // OpenRouter requires additional headers
-      if (activeLlm.provider === 'openrouter') {
-        headers['HTTP-Referer'] = 'https://agentaudit.dev';
-        headers['X-Title'] = 'AgentAudit CLI';
-      }
-      const res = await fetch(activeLlm.url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          model: activeLlm.model,
-          max_tokens: 8192,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-        }),
-        signal: AbortSignal.timeout(120_000),
-      });
-      data = await res.json();
-      if (data.error) {
-        console.log(` ${c.red}failed${c.reset}`);
-        const friendly = formatApiError(data.error, activeLlm.provider, res.status);
-        if (friendly) {
-          console.log(`  ${c.red}${friendly.text}${c.reset}`);
-          console.log(`  ${c.dim}${friendly.hint}${c.reset}`);
-        } else {
-          console.log(`  ${c.red}API error: ${data.error.message || JSON.stringify(data.error)}${c.reset}`);
+
+      const shared = [...findingsByTitle.values()].filter(f => f.models.length > 1);
+      const unique = [...findingsByTitle.values()].filter(f => f.models.length === 1);
+
+      if (shared.length > 0) {
+        console.log(`  ${c.bold}Shared findings (${shared.length}):${c.reset}`);
+        for (const f of shared) {
+          const sc = severityColor(f.severity);
+          console.log(`    ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset} ${f.title} ${c.dim}(${f.models.length}/${reports.length})${c.reset}`);
         }
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-        return null;
+        console.log();
       }
-      _lastLlmText = data.choices?.[0]?.message?.content || '';
-      report = extractJSON(_lastLlmText);
-      if (report) {
-        report.audit_model = data.model || activeLlm.model;
-        report.audit_provider = activeLlm.provider;
-        if (data.id) report.provider_msg_id = data.id;
-        if (data.system_fingerprint) report.provider_fingerprint = data.system_fingerprint;
-        if (data.usage) {
-          report.input_tokens = data.usage.prompt_tokens;
-          report.output_tokens = data.usage.completion_tokens;
+
+      if (unique.length > 0) {
+        console.log(`  ${c.bold}Unique findings (${unique.length}):${c.reset}`);
+        for (const f of unique) {
+          const sc = severityColor(f.severity);
+          console.log(`    ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset} ${f.title} ${c.dim}(${f.models[0]} only)${c.reset}`);
         }
+        console.log();
       }
     }
-    
-    console.log(` ${c.green}done${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
-  } catch (err) {
-    console.log(` ${c.red}failed${c.reset}`);
-    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) {
-      console.log(`  ${c.red}Request timed out (120s)${c.reset}`);
-      console.log(`  ${c.dim}The provider took too long to respond. Try again or use a faster model${c.reset}`);
-    } else if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.message?.includes('fetch failed')) {
-      console.log(`  ${c.red}Network error: could not reach ${activeProvider}${c.reset}`);
-      console.log(`  ${c.dim}Check your internet connection or provider status${c.reset}`);
-    } else {
-      console.log(`  ${c.red}${err.message}${c.reset}`);
+
+    // Upload each report
+    const noUpload = process.argv.includes('--no-upload');
+    const creds = loadCredentials();
+    if (!noUpload && creds) {
+      for (const { report } of reports) await uploadReport(report, creds);
+      console.log(`  ${c.dim}Reports: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
+    } else if (!noUpload && !creds) {
+      console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to upload reports to agentaudit.dev${c.reset}`);
     }
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+
+    console.log();
+    return reports.map(r => r.report);
+  }
+
+  // ── Single-Model Path ────────────────────────────────────
+  // If --models has exactly 1 model, use it; otherwise resolve via --model / config / env
+  let activeLlm;
+  if (modelNames.length === 1) {
+    activeLlm = resolveModel(modelNames[0]);
+  } else {
+    activeLlm = resolveProvider();
+    // Model override: --model flag > AGENTAUDIT_MODEL env > credentials.json > provider default
+    const modelArgIdx2 = process.argv.indexOf('--model');
+    const modelFlag2 = modelArgIdx2 !== -1 ? process.argv[modelArgIdx2 + 1] : null;
+    const modelOverride = modelFlag2 || process.env.AGENTAUDIT_MODEL || loadLlmConfig()?.llm_model || null;
+    if (activeLlm && modelOverride) activeLlm.model = modelOverride;
+  }
+
+  if (!activeLlm) {
+    console.log();
+    console.log(`  ${c.yellow}No LLM API key found.${c.reset} The ${c.bold}audit${c.reset} command needs an LLM to analyze code.`);
+    console.log();
+    console.log(`  ${c.bold}Set an API key${c.reset} (e.g. ${c.cyan}export OPENROUTER_API_KEY=sk-or-...${c.reset})`);
+    console.log(`  ${c.dim}Run "agentaudit model" to configure provider + model interactively${c.reset}`);
+    console.log();
+    console.log(`  ${c.bold}Or export for manual review:${c.reset} ${c.cyan}agentaudit audit ${url} --export${c.reset}`);
+    console.log(`  ${c.bold}Or use as MCP server${c.reset} in Cursor/Claude ${c.dim}(no extra API key needed)${c.reset}`);
+    console.log(`  ${c.dim}{ "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } }${c.reset}`);
+    console.log();
+    if (process.argv.includes('--export')) {
+      const exportPath = path.join(process.cwd(), `audit-${slug}.md`);
+      const exportContent = [
+        `# Security Audit: ${slug}`, `**Source:** ${url}`, `**Files:** ${files.length}`, ``,
+        `## Audit Instructions`, ``, auditPrompt || '(audit prompt not found)', ``,
+        `## Report Format`, ``, `After analysis, produce a JSON report:`,
+        '```json', `{ "skill_slug": "${slug}", "source_url": "${url}", "risk_score": 0, "result": "safe", "findings": [] }`, '```',
+        ``, `## Source Code`, ``, codeBlock,
+      ].join('\n');
+      fs.writeFileSync(exportPath, exportContent);
+      console.log(`  ${icons.safe}  Exported to ${c.bold}${exportPath}${c.reset}`);
+      console.log(`  ${c.dim}Paste this into any LLM (Claude, ChatGPT, etc.) for analysis${c.reset}`);
+    }
     return null;
   }
-  
-  // Provenance: compute BEFORE cleanup (needs repoPath on disk)
-  let commitSha = '';
-  try {
-    commitSha = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
-  } catch { /* shallow clone without HEAD — unlikely but safe */ }
-  const sourceHash = crypto.createHash('sha256').update(
-    files.slice().sort((a, b) => a.path.localeCompare(b.path))
-      .map(f => f.path + '\n' + f.content).join('\n')
-  ).digest('hex');
-  // Code-based type detection (uses files array in memory + repoPath for context)
-  const pkgInfo = detectPackageInfo(repoPath, files);
-  // Known MCP frameworks are libraries, not servers (they contain MCP patterns but ARE the SDK)
-  const KNOWN_MCP_LIBS = new Set(['fastmcp', 'jlowin-fastmcp', 'mcp-go', 'fastapi-mcp', 'fastapi_mcp', 'mcp-use', 'mcp-agent']);
-  const KNOWN_CLI = new Set(['mcp-cli', 'mcp-scan', 'inspector']);
-  let detectedType = pkgInfo.type === 'unknown' ? 'other' : pkgInfo.type;
-  if (KNOWN_MCP_LIBS.has(slug)) detectedType = 'library';
-  if (KNOWN_CLI.has(slug)) detectedType = 'cli-tool';
 
-  // Cleanup repo (safe now — provenance data captured above)
-  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  // Single LLM call via callLlm()
+  const modelLabel = `${activeLlm.name} → ${activeLlm.model}`;
+  process.stdout.write(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${modelLabel})${c.reset}...`);
 
+  const llmResult = await callLlm(activeLlm, systemPrompt, userMessage);
+
+  if (llmResult.error) {
+    console.log(` ${c.red}failed${c.reset}`);
+    console.log(`  ${c.red}${llmResult.error}${c.reset}`);
+    if (llmResult.hint) console.log(`  ${c.dim}${llmResult.hint}${c.reset}`);
+    return null;
+  }
+
+  console.log(` ${c.green}done${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
+
+  const report = llmResult.report;
   if (!report) {
     console.log(`  ${c.red}Could not parse LLM response as JSON${c.reset}`);
     console.log(`  ${c.dim}Hint: run with --debug to see the raw LLM response${c.reset}`);
     if (process.argv.includes('--debug')) {
       console.log(`  ${c.dim}--- Raw LLM response (first 2000 chars) ---${c.reset}`);
-      console.log((typeof _lastLlmText === 'string' ? _lastLlmText : '(empty)').slice(0, 2000));
+      console.log((llmResult.text || '(empty)').slice(0, 2000));
       console.log(`  ${c.dim}--- end ---${c.reset}`);
     }
     return null;
   }
 
-  // Force slug from URL — never trust LLM-provided skill_slug
-  report.skill_slug = slug;
-
-  // Force package_type from code detection — never trust LLM-provided type
-  report.package_type = detectedType;
-
-  // Add scan metadata for benchmarking
-  report.audit_duration_ms = Date.now() - start;
-  report.files_scanned = files.length;
-
-  // Set provenance data
-  if (commitSha) report.commit_sha = commitSha;
-  report.source_hash = sourceHash;
+  enrichReport(report);
+  saveHistory(report);
 
   // Display results
   console.log();
-  const riskScore = report.risk_score || 0;
   console.log(sectionHeader('Result'));
-  console.log(`  ${riskBadge(riskScore)}`);
+  console.log(`  ${riskBadge(report.risk_score || 0)}`);
   console.log();
 
   if (report.findings && report.findings.length > 0) {
@@ -2839,8 +3010,6 @@ async function auditRepo(url) {
       if (f.description) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.description.slice(0, 120)}${c.reset}`);
       console.log();
     }
-
-    // Severity histogram
     const histLines = severityHistogram(report.findings);
     if (histLines.length > 1) {
       console.log(sectionHeader('Severity'));
@@ -2851,41 +3020,16 @@ async function auditRepo(url) {
     console.log(`  ${c.green}No findings — package looks clean.${c.reset}`);
     console.log();
   }
-  
-  // Upload to registry (skip with --no-upload)
+
+  // Upload to registry
   const noUpload = process.argv.includes('--no-upload');
   let creds = loadCredentials();
   if (noUpload) {
     // Skip silently
   } else if (creds) {
-    process.stdout.write(`  Uploading report to registry...`);
-    try {
-      const res = await fetch(`${REGISTRY_URL}/api/reports`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${creds.api_key}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(report),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        console.log(` ${c.green}done${c.reset}`);
-        console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
-      } else {
-        let errBody = '';
-        try { errBody = await res.text(); } catch {}
-        console.log(` ${c.yellow}failed (HTTP ${res.status})${c.reset}`);
-        if (errBody && process.argv.includes('--debug')) {
-          console.log(`  ${c.dim}Server: ${errBody.slice(0, 300)}${c.reset}`);
-        }
-      }
-    } catch (err) {
-      console.log(` ${c.yellow}failed${c.reset}`);
-    }
+    await uploadReport(report, creds);
+    console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
   } else if (process.stdin.isTTY) {
-    // No credentials — prompt to paste key or set up
     console.log();
     console.log(`  ${c.bold}Want to upload this report to agentaudit.dev?${c.reset}`);
     console.log(`  ${c.dim}Create an API key at ${c.cyan}${REGISTRY_URL}/profile${c.dim} (sign in with GitHub)${c.reset}`);
@@ -2899,27 +3043,8 @@ async function auditRepo(url) {
         saveCredentials({ api_key: pastedKey.trim(), agent_name: agentName });
         creds = { api_key: pastedKey.trim(), agent_name: agentName };
         console.log(` ${c.green}valid!${c.reset}`);
-        process.stdout.write(`  Uploading report...`);
-        try {
-          const res = await fetch(`${REGISTRY_URL}/api/reports`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${creds.api_key}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(report),
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (res.ok) {
-            console.log(` ${c.green}done${c.reset}`);
-            console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
-          } else {
-            console.log(` ${c.yellow}failed (HTTP ${res.status})${c.reset}`);
-          }
-        } catch (err) {
-          console.log(` ${c.red}failed${c.reset}`);
-          console.log(`  ${c.dim}${err.message}${c.reset}`);
-        }
+        await uploadReport(report, creds);
+        console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
       } else {
         console.log(` ${c.red}invalid key${c.reset}`);
         console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to configure.${c.reset}`);
@@ -2928,7 +3053,7 @@ async function auditRepo(url) {
   } else {
     console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to configure your API key and upload reports${c.reset}`);
   }
-  
+
   console.log();
   return report;
 }
@@ -3812,9 +3937,11 @@ async function main() {
   // Strip global flags from args (including --model <value>)
   const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color', '--no-upload']);
   let args = rawArgs.filter(a => !globalFlags.has(a));
-  // Remove --model <value> pair
+  // Remove --model <value> and --models <value> pairs
   const modelIdx = args.indexOf('--model');
   if (modelIdx !== -1) args.splice(modelIdx, 2);
+  const modelsIdx = args.indexOf('--models');
+  if (modelsIdx !== -1) args.splice(modelsIdx, 2);
   
   // Detect per-command --help BEFORE stripping (e.g. `agentaudit model --help`)
   const wantsHelp = args.includes('--help') || args.includes('-h');
@@ -3864,15 +3991,16 @@ async function main() {
       `Deep LLM-powered 3-pass security audit (~30s). Requires an LLM API key.`,
       ``,
       `${c.bold}Options:${c.reset}`,
-      `  --model <name>   Override LLM model for this run`,
-      `  --no-upload      Skip uploading report to registry`,
-      `  --export         Export audit payload as markdown (for manual LLM review)`,
-      `  --debug          Show raw LLM response on parse errors`,
+      `  --model <name>     Override LLM model for this run`,
+      `  --models <a,b,c>   Multi-model audit (parallel calls, consensus comparison)`,
+      `  --no-upload        Skip uploading report to registry`,
+      `  --export           Export audit payload as markdown (for manual LLM review)`,
+      `  --debug            Show raw LLM response on parse errors`,
       ``,
       `${c.bold}Examples:${c.reset}`,
       `  agentaudit audit https://github.com/owner/repo`,
-      `  agentaudit audit https://github.com/owner/repo --no-upload`,
       `  agentaudit audit https://github.com/owner/repo --model gpt-4o`,
+      `  agentaudit audit https://github.com/owner/repo --models gemini-2.5-flash,claude-sonnet-4-20250514`,
       `  agentaudit audit https://github.com/owner/repo --export`,
     ],
     lookup: [
@@ -3986,10 +4114,32 @@ async function main() {
       `  agentaudit benchmark --json`,
     ],
     bench: null, // alias → benchmark
+    consensus: [
+      `${c.bold}agentaudit consensus${c.reset} <package-name>`,
+      ``,
+      `View multi-model consensus status from the AgentAudit registry.`,
+      `Shows agreement across different LLM models and peer reviewers.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit consensus nanobanana-mcp-server`,
+      `  agentaudit consensus fastmcp --json`,
+    ],
+    history: [
+      `${c.bold}agentaudit history${c.reset} [options]`,
+      ``,
+      `Show your local audit history. Results are stored in ~/.config/agentaudit/history/`,
+      `after every audit run. No internet connection required.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+    ],
     activity: [
       `${c.bold}agentaudit activity${c.reset} [options]`,
       ``,
-      `Show your recent audits and findings from the AgentAudit registry.`,
+      `Show your recent audits and findings from the AgentAudit registry (online).`,
       `Requires being logged in (run ${c.cyan}agentaudit setup${c.reset} first).`,
       ``,
       `${c.bold}Options:${c.reset}`,
@@ -4087,12 +4237,14 @@ async function main() {
     console.log(`    ${c.cyan}audit${c.reset} <url> [url...]  Deep LLM-powered security audit (~30s)`);
     console.log(`    ${c.cyan}validate${c.reset} [path]       Validate SKILL.md format & security`);
     console.log(`    ${c.cyan}lookup${c.reset} <name>         Look up package in registry`);
+    console.log(`    ${c.cyan}consensus${c.reset} <name>      View multi-model consensus for a package`);
     console.log();
     console.log(`  ${c.bold}COMMUNITY${c.reset}`);
     console.log(`    ${c.cyan}dashboard${c.reset}             Interactive dashboard (full-screen)`);
     console.log(`    ${c.cyan}leaderboard${c.reset}           Top contributors ranking`);
     console.log(`    ${c.cyan}benchmark${c.reset}             LLM model performance comparison`);
-    console.log(`    ${c.cyan}activity${c.reset}              Your recent audits & findings`);
+    console.log(`    ${c.cyan}history${c.reset}               Your local audit history`);
+    console.log(`    ${c.cyan}activity${c.reset}              Your recent audits & findings (online)`);
     console.log(`    ${c.cyan}search${c.reset} <query>        Search packages in registry`);
     console.log();
     console.log(`  ${c.bold}CONFIGURATION${c.reset}`);
@@ -4106,6 +4258,7 @@ async function main() {
     console.log(`    ${c.dim}--quiet            Suppress banner${c.reset}`);
     console.log(`    ${c.dim}--no-color         Disable ANSI colors (also: NO_COLOR env)${c.reset}`);
     console.log(`    ${c.dim}--model <name>     Override LLM model for this run${c.reset}`);
+    console.log(`    ${c.dim}--models <a,b,c>   Multi-model audit (parallel, with consensus)${c.reset}`);
     console.log(`    ${c.dim}--no-upload        Skip uploading report to registry${c.reset}`);
     console.log(`    ${c.dim}--export           Export audit payload as markdown${c.reset}`);
     console.log(`    ${c.dim}--debug            Show raw LLM response on parse errors${c.reset}`);
@@ -4114,6 +4267,7 @@ async function main() {
     console.log(`    agentaudit discover --quick`);
     console.log(`    agentaudit scan https://github.com/owner/repo`);
     console.log(`    agentaudit audit https://github.com/owner/repo`);
+    console.log(`    agentaudit audit <url> --models gemini-2.5-flash,claude-sonnet-4-20250514`);
     console.log(`    agentaudit lookup fastmcp --json`);
     console.log();
     console.log(`  ${c.bold}LEARN MORE${c.reset}`);
@@ -4140,12 +4294,110 @@ async function main() {
     await benchmarkCommand(targets);
     return;
   }
+  if (command === 'history') {
+    banner();
+    const entries = loadHistory(30);
+    if (entries.length === 0) {
+      console.log(`  ${c.dim}No local audit history yet. Run ${c.cyan}agentaudit audit <url>${c.dim} to start.${c.reset}`);
+      console.log();
+      return;
+    }
+
+    if (jsonMode) {
+      console.log(JSON.stringify(entries, null, 2));
+      return;
+    }
+
+    console.log(sectionHeader(`Local History (${entries.length})`));
+    console.log();
+
+    for (const entry of entries) {
+      const slug = entry.skill_slug || 'unknown';
+      const risk = entry.risk_score ?? '?';
+      const sev = entry.max_severity || 'none';
+      const sc = severityColor(sev);
+      const model = entry.audit_model || '?';
+      const fc = entry.findings?.length || 0;
+      const ts = entry._file?.slice(0, 10) || '';
+      console.log(`  ${sc}┃${c.reset} ${c.bold}${slug.padEnd(30)}${c.reset} ${riskBadge(risk)}  ${c.dim}${model}${c.reset}`);
+      console.log(`  ${sc}┃${c.reset} ${c.dim}${ts}  ${fc} findings  ${sev.toUpperCase()}${c.reset}`);
+      console.log();
+    }
+    return;
+  }
   if (command === 'activity' || command === 'my') {
     await activityCommand(targets);
     return;
   }
   if (command === 'search' || command === 'find') {
     await searchCommand(targets);
+    return;
+  }
+  if (command === 'consensus') {
+    banner();
+    const pkg = targets[0];
+    if (!pkg) {
+      console.log(`  ${c.red}Error: package name required${c.reset}`);
+      console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit consensus <package-name>${c.reset}`);
+      process.exitCode = 2;
+      return;
+    }
+    const slug = pkg.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (!jsonMode) console.log(`  Fetching consensus for ${c.bold}${slug}${c.reset}...`);
+    try {
+      const res = await fetch(`${REGISTRY_URL}/api/packages/${slug}/consensus`, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) {
+        if (res.status === 404) {
+          console.log(`  ${c.yellow}Not found${c.reset} — "${slug}" hasn't been audited yet.`);
+          console.log(`  ${c.dim}Run: ${c.cyan}agentaudit audit <repo-url>${c.dim} to create the first audit${c.reset}`);
+        } else {
+          console.log(`  ${c.red}API error (HTTP ${res.status})${c.reset}`);
+        }
+        return;
+      }
+      const data = await res.json();
+      if (jsonMode) { console.log(JSON.stringify(data, null, 2)); return; }
+
+      console.log();
+      console.log(sectionHeader(`Consensus: ${slug}`));
+      console.log();
+
+      // Status
+      const status = data.consensus_status || data.status || 'pending';
+      const statusColor = status === 'reached' ? c.green : status === 'disputed' ? c.yellow : c.dim;
+      console.log(`  Status:   ${statusColor}${status.toUpperCase()}${c.reset}`);
+
+      // Risk + Severity
+      if (data.consensus_risk_score != null) console.log(`  Risk:     ${riskBadge(data.consensus_risk_score)}`);
+      if (data.consensus_severity) {
+        const sc = severityColor(data.consensus_severity);
+        console.log(`  Severity: ${sc}${data.consensus_severity.toUpperCase()}${c.reset}`);
+      }
+
+      // Models
+      if (data.models && data.models.length > 0) {
+        console.log();
+        console.log(`  ${c.bold}Models (${data.models.length}):${c.reset}`);
+        for (const m of data.models) {
+          const sc = severityColor(m.severity || m.max_severity);
+          const risk = m.risk_score ?? '?';
+          console.log(`    ${sc}┃${c.reset} ${(m.model || m.audit_model || '?').padEnd(30)} ${c.dim}risk ${risk}${c.reset}  ${sc}${(m.severity || m.max_severity || '').toUpperCase()}${c.reset}`);
+        }
+      }
+
+      // Reviewers
+      if (data.reviews != null || data.reviewer_count != null) {
+        const count = data.reviewer_count || data.reviews?.length || 0;
+        console.log();
+        console.log(`  ${c.dim}Reviews: ${count}  |  Threshold: 5 reviewers, >60% agreement${c.reset}`);
+      }
+
+      console.log();
+      console.log(`  ${c.dim}Full details: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
+      console.log();
+    } catch (err) {
+      console.log(`  ${c.red}Failed: ${err.message}${c.reset}`);
+    }
     return;
   }
 
@@ -4729,8 +4981,13 @@ async function main() {
     
     let hasFindings = false;
     for (const url of urls) {
-      const report = await auditRepo(url);
-      if (report?.findings?.length > 0) hasFindings = true;
+      const result = await auditRepo(url);
+      // Multi-model returns array, single-model returns object
+      if (Array.isArray(result)) {
+        if (result.some(r => r?.findings?.length > 0)) hasFindings = true;
+      } else if (result?.findings?.length > 0) {
+        hasFindings = true;
+      }
     }
     process.exitCode = hasFindings ? 1 : 0;
     return;
