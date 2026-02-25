@@ -1,21 +1,32 @@
 #!/usr/bin/env node
 /**
  * AgentAudit CLI — Security scanner for AI packages
- * 
- * Usage:
- *   agentaudit                                     Discover local MCP servers
- *   agentaudit discover [--quick|--deep]            Find MCP servers in AI editors
- *   agentaudit scan <repo-url> [--deep]             Quick scan (or deep audit with --deep)
- *   agentaudit audit <repo-url>                     Deep LLM-powered security audit
- *   agentaudit lookup <name>                        Look up package in registry
- *   agentaudit setup                                Register + configure API key
- * 
- * Global flags: --json, --quiet, --no-color
+ *
+ * Usage: agentaudit <command> [options]
+ *
+ * Commands:
+ *   discover              Find MCP servers across all AI tools
+ *   scan <url> [url...]   Quick static scan (regex)
+ *   audit <url> [url...]  Deep LLM-powered security audit
+ *   lookup <name>         Look up package in registry
+ *   dashboard             Interactive full-screen dashboard
+ *   leaderboard           Top contributors ranking
+ *   benchmark             LLM model performance comparison
+ *   activity              Your recent audits & findings
+ *   search <query>        Search packages in registry
+ *   model [name|reset]    Configure LLM provider + model
+ *   setup                 Log in to agentaudit.dev (for report uploads)
+ *   status                Show current config + auth status
+ *   profile               Your profile — rank, points, audit stats
+ *   help [command]        Show help
+ *
+ * Flags: --json, --quiet, --no-color, --no-upload, --model, --export, --debug
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { execSync, execFileSync } from 'child_process';
 import { createInterface } from 'readline';
 import { fileURLToPath } from 'url';
@@ -48,6 +59,51 @@ const LLM_PROVIDERS = [
   // Meta-provider (routes to any model)
   { key: 'OPENROUTER_API_KEY',  name: 'OpenRouter',            provider: 'openrouter',  type: 'openai',    model: 'anthropic/claude-sonnet-4', url: 'https://openrouter.ai/api/v1/chat/completions' },
 ];
+
+// ── Provider-specific model choices (for interactive menu) ──
+const PROVIDER_MODELS = {
+  anthropic: [
+    { label: 'claude-sonnet-4-20250514', sublabel: 'fast + smart (default)', value: 'claude-sonnet-4-20250514' },
+    { label: 'claude-opus-4-20250514',   sublabel: 'most capable',           value: 'claude-opus-4-20250514' },
+  ],
+  openai: [
+    { label: 'gpt-4o',  sublabel: 'fast multimodal (default)', value: 'gpt-4o' },
+    { label: 'gpt-4.1', sublabel: 'latest',                    value: 'gpt-4.1' },
+  ],
+  google: [
+    { label: 'gemini-2.5-flash', sublabel: 'fast + cheap (default)', value: 'gemini-2.5-flash' },
+    { label: 'gemini-2.5-pro',   sublabel: 'most capable',          value: 'gemini-2.5-pro' },
+  ],
+  deepseek: [
+    { label: 'deepseek-chat', sublabel: 'cost-effective (default)', value: 'deepseek-chat' },
+  ],
+  mistral: [
+    { label: 'mistral-large-latest', sublabel: 'EU-hosted (default)', value: 'mistral-large-latest' },
+  ],
+  groq: [
+    { label: 'llama-3.3-70b-versatile', sublabel: 'ultra-fast (default)', value: 'llama-3.3-70b-versatile' },
+  ],
+  xai: [
+    { label: 'grok-3', sublabel: 'real-time knowledge (default)', value: 'grok-3' },
+  ],
+  together: [
+    { label: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', sublabel: 'open source (default)', value: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
+  ],
+  fireworks: [
+    { label: 'accounts/fireworks/models/llama-v3p3-70b-instruct', sublabel: 'open source (default)', value: 'accounts/fireworks/models/llama-v3p3-70b-instruct' },
+  ],
+  cerebras: [
+    { label: 'llama-3.3-70b', sublabel: 'fast inference (default)', value: 'llama-3.3-70b' },
+  ],
+  zhipu: [
+    { label: 'glm-4.7', sublabel: 'Chinese language (default)', value: 'glm-4.7' },
+  ],
+  openrouter: [
+    { label: 'anthropic/claude-sonnet-4', sublabel: 'default',         value: 'anthropic/claude-sonnet-4' },
+    { label: 'qwen/qwen3-coder',          sublabel: 'code specialist', value: 'qwen/qwen3-coder' },
+    { label: 'meta-llama/Llama-3.3-70B',  sublabel: 'open source',    value: 'meta-llama/Llama-3.3-70B' },
+  ],
+};
 
 // ── ANSI Colors (respects NO_COLOR and --no-color) ───────
 
@@ -93,6 +149,7 @@ const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
 const USER_CRED_DIR = path.join(xdgConfig, 'agentaudit');
 const USER_CRED_FILE = path.join(USER_CRED_DIR, 'credentials.json');
 const SKILL_CRED_FILE = path.join(SKILL_DIR, 'config', 'credentials.json');
+const PROFILE_CACHE_FILE = path.join(USER_CRED_DIR, 'profile-cache.json');
 
 function loadCredentials() {
   for (const f of [SKILL_CRED_FILE, USER_CRED_FILE]) {
@@ -114,20 +171,23 @@ function loadLlmConfig() {
     if (fs.existsSync(f)) {
       try {
         const data = JSON.parse(fs.readFileSync(f, 'utf8'));
-        if (data.llm_model) return { llm_model: data.llm_model };
+        if (data.llm_model || data.preferred_provider) {
+          return { llm_model: data.llm_model || null, preferred_provider: data.preferred_provider || null };
+        }
       } catch {}
     }
   }
   return null;
 }
 
-function saveLlmConfig(model) {
+function saveLlmConfig(model, provider) {
   // Merge into existing credentials
   let existing = {};
   if (fs.existsSync(USER_CRED_FILE)) {
     try { existing = JSON.parse(fs.readFileSync(USER_CRED_FILE, 'utf8')); } catch {}
   }
-  existing.llm_model = model;
+  if (model !== undefined) existing.llm_model = model;
+  if (provider !== undefined) existing.preferred_provider = provider;
   const json = JSON.stringify(existing, null, 2);
   fs.mkdirSync(USER_CRED_DIR, { recursive: true });
   fs.writeFileSync(USER_CRED_FILE, json, { mode: 0o600 });
@@ -136,10 +196,30 @@ function saveLlmConfig(model) {
     if (fs.existsSync(SKILL_CRED_FILE)) {
       try { skillExisting = JSON.parse(fs.readFileSync(SKILL_CRED_FILE, 'utf8')); } catch {}
     }
-    skillExisting.llm_model = model;
+    if (model !== undefined) skillExisting.llm_model = model;
+    if (provider !== undefined) skillExisting.preferred_provider = provider;
     fs.mkdirSync(path.dirname(SKILL_CRED_FILE), { recursive: true });
     fs.writeFileSync(SKILL_CRED_FILE, JSON.stringify(skillExisting, null, 2), { mode: 0o600 });
   } catch {}
+}
+
+function resolveProvider() {
+  const config = loadLlmConfig();
+  const preferred = config?.preferred_provider;
+
+  if (preferred) {
+    // Find provider by name, check if any of their keys is set
+    const match = LLM_PROVIDERS.find(p => p.provider === preferred && process.env[p.key]);
+    if (match) return match;
+    // Key missing for preferred provider — warn + fallback
+    const providerInfo = LLM_PROVIDERS.find(p => p.provider === preferred);
+    if (providerInfo && !quietMode) {
+      console.log(`  ${c.yellow}Preferred provider "${providerInfo.name}" missing key (${providerInfo.key}), falling back...${c.reset}`);
+    }
+  }
+
+  // Fallback: first match wins
+  return LLM_PROVIDERS.find(p => process.env[p.key]) || null;
 }
 
 function saveCredentials(data) {
@@ -149,6 +229,29 @@ function saveCredentials(data) {
   try {
     fs.mkdirSync(path.dirname(SKILL_CRED_FILE), { recursive: true });
     fs.writeFileSync(SKILL_CRED_FILE, json, { mode: 0o600 });
+  } catch {}
+}
+
+function loadProfileCache() {
+  try {
+    if (!fs.existsSync(PROFILE_CACHE_FILE)) return null;
+    const data = JSON.parse(fs.readFileSync(PROFILE_CACHE_FILE, 'utf8'));
+    // TTL: 10 minutes
+    if (data.fetched_at && Date.now() - data.fetched_at < 10 * 60 * 1000) return data;
+    return null; // expired
+  } catch { return null; }
+}
+
+function saveProfileCache(data) {
+  try {
+    fs.mkdirSync(USER_CRED_DIR, { recursive: true });
+    fs.writeFileSync(PROFILE_CACHE_FILE, JSON.stringify({
+      agent_name: data.agent_name,
+      rank: data.rank,
+      total_points: data.total_points,
+      total_reports: data.total_reports,
+      fetched_at: Date.now(),
+    }, null, 2), { mode: 0o600 });
   } catch {}
 }
 
@@ -333,25 +436,31 @@ function singleSelect(items, { title = 'Select', hint = '↑↓=move  Enter=sele
   });
 }
 
-async function registerAgent(agentName) {
-  const res = await fetch(`${REGISTRY_URL}/api/register`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ agent_name: agentName }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw new Error(`Registration failed (HTTP ${res.status}): ${await res.text()}`);
-  return res.json();
+async function validateApiKey(apiKey) {
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/auth/validate`, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { valid: true, agent_name: data.agent_name || null };
+    }
+    return { valid: false, agent_name: null };
+  } catch {
+    return { valid: false, agent_name: null };
+  }
 }
 
 async function setupCommand() {
-  console.log(`  ${c.bold}Setup${c.reset}`);
+  console.log(`  ${c.bold}AgentAudit Setup${c.reset}`);
+  console.log(`  ${c.dim}Link your API key to upload audit reports to agentaudit.dev${c.reset}`);
   console.log();
 
   const existing = loadCredentials();
   if (existing) {
     console.log(`  ${icons.safe}  Already configured as ${c.bold}${existing.agent_name}${c.reset}`);
-    console.log(`  ${c.dim}Key: ${existing.api_key.slice(0, 8)}...${c.reset}`);
+    console.log(`  ${c.dim}Key: ${existing.api_key.slice(0, 12)}...${c.reset}`);
     console.log();
     const answer = await askQuestion(`  Reconfigure? ${c.dim}(y/N)${c.reset} `);
     if (answer.toLowerCase() !== 'y') {
@@ -361,68 +470,43 @@ async function setupCommand() {
     console.log();
   }
 
-  console.log(`  ${c.bold}1)${c.reset} Register new agent ${c.dim}(free, creates API key automatically)${c.reset}`);
-  console.log(`  ${c.bold}2)${c.reset} Enter existing API key`);
+  console.log(`  ${c.bold}Step 1:${c.reset} Create an API key at ${c.cyan}${REGISTRY_URL}/profile${c.reset}`);
+  console.log(`  ${c.dim}Sign in with GitHub, then click "Create API Key".${c.reset}`);
   console.log();
-  const choice = await askQuestion(`  Choice ${c.dim}(1/2)${c.reset}: `);
-  console.log();
+  const key = await askQuestion(`  ${c.bold}Step 2:${c.reset} Paste your API key here: `);
+  if (!key || !key.trim()) {
+    console.log(`  ${c.red}No key entered.${c.reset}`);
+    return;
+  }
 
-  if (choice === '2') {
-    const key = await askQuestion(`  API Key: `);
-    if (!key) { console.log(`  ${c.red}No key entered.${c.reset}`); return; }
-    const name = await askQuestion(`  Agent name ${c.dim}(optional)${c.reset}: `);
-    saveCredentials({ api_key: key, agent_name: name || 'custom' });
+  process.stdout.write(`  Validating...`);
+  const validation = await validateApiKey(key.trim());
+  if (validation.valid) {
+    const agentName = validation.agent_name || 'agent';
+    saveCredentials({ api_key: key.trim(), agent_name: agentName });
+    console.log(` ${c.green}valid!${c.reset}`);
     console.log();
-    console.log(`  ${icons.safe}  Saved! Key stored in ${c.dim}${USER_CRED_FILE}${c.reset}`);
+    console.log(`  ${icons.safe}  Logged in as ${c.bold}${agentName}${c.reset}`);
+    console.log(`  ${c.dim}Key saved to: ${USER_CRED_FILE}${c.reset}`);
   } else {
-    const name = await askQuestion(`  Agent name ${c.dim}(e.g. my-scanner, claude-desktop)${c.reset}: `);
-    if (!name || !/^[a-zA-Z0-9._-]{2,64}$/.test(name)) {
-      console.log(`  ${c.red}Invalid name. Use 2-64 chars: letters, numbers, dash, underscore, dot.${c.reset}`);
-      return;
-    }
-    process.stdout.write(`  Registering ${c.bold}${name}${c.reset}...`);
-    try {
-      const data = await registerAgent(name);
-      saveCredentials({ api_key: data.api_key, agent_name: data.agent_name });
-      console.log(` ${c.green}done!${c.reset}`);
-      console.log();
-      console.log(`  ${icons.safe}  Registered as ${c.bold}${data.agent_name}${c.reset}`);
-      console.log(`  ${c.dim}Key: ${data.api_key.slice(0, 12)}...${c.reset}`);
-      console.log(`  ${c.dim}Saved to: ${USER_CRED_FILE}${c.reset}`);
-    } catch (err) {
-      console.log(` ${c.red}failed${c.reset}`);
-      console.log(`  ${c.red}${err.message}${c.reset}`);
-      return;
-    }
+    console.log(` ${c.red}invalid${c.reset}`);
+    console.log(`  ${c.red}Key not recognized. Make sure you copied the full key from ${REGISTRY_URL}/profile${c.reset}`);
+    return;
   }
 
   console.log();
 
-  // ── LLM model configuration ──
+  // ── LLM configuration hint ──
   const llmConfig = loadLlmConfig();
-  console.log(`  ${c.bold}LLM Model Configuration${c.reset}`);
-  console.log(`  ${c.dim}Used for deep audits. Requires an LLM API key in your environment.${c.reset}`);
-  console.log();
-  if (llmConfig) {
-    console.log(`  ${icons.safe}  Current model: ${c.bold}${llmConfig.llm_model}${c.reset}`);
-    console.log();
+  console.log(`  ${c.bold}LLM Configuration${c.reset}`);
+  if (llmConfig?.llm_model || llmConfig?.preferred_provider) {
+    const parts = [];
+    if (llmConfig.preferred_provider) parts.push(llmConfig.preferred_provider);
+    if (llmConfig.llm_model) parts.push(llmConfig.llm_model);
+    console.log(`  ${icons.safe}  Current: ${c.bold}${parts.join(' → ')}${c.reset}`);
   }
-  console.log(`  ${c.dim}Examples:${c.reset}`);
-  console.log(`    ${c.dim}claude-sonnet-4-20250514${c.reset}        ${c.dim}(Anthropic)${c.reset}`);
-  console.log(`    ${c.dim}gpt-4o${c.reset}                          ${c.dim}(OpenAI)${c.reset}`);
-  console.log(`    ${c.dim}gemini-2.5-flash${c.reset}                ${c.dim}(Google)${c.reset}`);
-  console.log(`    ${c.dim}qwen/qwen3.5-coder-32b${c.reset}         ${c.dim}(OpenRouter)${c.reset}`);
-  console.log(`    ${c.dim}deepseek-chat${c.reset}                   ${c.dim}(DeepSeek)${c.reset}`);
-  console.log();
-  const modelAnswer = await askQuestion(`  Model ${c.dim}(Enter to keep default, or type model name)${c.reset}: `);
-  if (modelAnswer) {
-    saveLlmConfig(modelAnswer);
-    console.log(`  ${icons.safe}  Model set to ${c.bold}${modelAnswer}${c.reset}`);
-  } else if (llmConfig) {
-    console.log(`  ${c.dim}Keeping: ${llmConfig.llm_model}${c.reset}`);
-  } else {
-    console.log(`  ${c.dim}No custom model — will use provider default${c.reset}`);
-  }
+  console.log(`  ${c.dim}Run ${c.cyan}agentaudit model${c.dim} to configure your LLM provider and model.${c.reset}`);
+  console.log(`  ${c.dim}Deep audits require an LLM API key in your environment.${c.reset}`);
   console.log();
 
   console.log(`  ${c.bold}Ready!${c.reset} You can now:`);
@@ -465,8 +549,17 @@ function getVersion() {
 function banner() {
   if (quietMode || jsonMode) return;
   console.log();
-  console.log(`  ${c.bold}${c.cyan}AgentAudit${c.reset} ${c.dim}v${getVersion()}${c.reset}`);
-  console.log(`  ${c.dim}Security scanner for AI packages${c.reset}`);
+  const cache = loadProfileCache();
+  if (cache) {
+    const rankStr = cache.rank != null ? `#${cache.rank}` : '';
+    const ptsStr = `${fmtNum(cache.total_points)}pts`;
+    const auditsStr = `${fmtNum(cache.total_reports)} audits`;
+    const profile = [cache.agent_name, rankStr, ptsStr, auditsStr].filter(Boolean).join(' \u00b7 ');
+    console.log(`  ${c.bold}${c.cyan}\u25c6 AgentAudit${c.reset} ${c.dim}v${getVersion()}${c.reset}  ${c.dim}\u2502${c.reset}  ${profile}`);
+  } else {
+    console.log(`  ${c.bold}${c.cyan}AgentAudit${c.reset} ${c.dim}v${getVersion()}${c.reset}`);
+    console.log(`  ${c.dim}Security scanner for AI packages${c.reset}`);
+  }
   console.log();
 }
 
@@ -483,10 +576,14 @@ function elapsed(startMs) {
 }
 
 function riskBadge(score) {
-  if (score === 0) return `${c.bgGreen}${c.bold}${c.white} SAFE ${c.reset}`;
-  if (score <= 10) return `${c.bgGreen}${c.white} LOW ${c.reset}`;
-  if (score <= 30) return `${c.bgYellow}${c.bold} CAUTION ${c.reset}`;
-  return `${c.bgRed}${c.bold}${c.white} UNSAFE ${c.reset}`;
+  const badge = score === 0 ? `${c.bgGreen}${c.bold}${c.white} SAFE ${c.reset}`
+    : score <= 10 ? `${c.bgGreen}${c.white} LOW ${c.reset}`
+    : score <= 30 ? `${c.bgYellow}${c.bold} CAUTION ${c.reset}`
+    : `${c.bgRed}${c.bold}${c.white} UNSAFE ${c.reset}`;
+  const filled = Math.min(Math.round(score / 20), 5);
+  const gaugeColor = score <= 10 ? c.green : score <= 30 ? c.yellow : c.red;
+  const gauge = `${gaugeColor}${'▰'.repeat(filled)}${c.dim}${'▱'.repeat(5 - filled)}${c.reset}`;
+  return `${badge} ${gauge}  ${score}/100`;
 }
 
 function severityColor(sev) {
@@ -507,6 +604,161 @@ function severityIcon(sev) {
     case 'low': return `${c.blue}●${c.reset}`;
     default: return `${c.green}●${c.reset}`;
   }
+}
+
+// ── TUI Rendering Helpers ───────────────────────────────
+
+const term = {
+  clearScreen: '\x1b[2J\x1b[H',
+  hideCursor: '\x1b[?25l',
+  showCursor: '\x1b[?25h',
+  altScreenOn: '\x1b[?1049h',
+  altScreenOff: '\x1b[?1049l',
+  moveTo: (r, col) => `\x1b[${r};${col}H`,
+  clearLine: '\x1b[2K',
+  underline: '\x1b[4m',
+  noUnderline: '\x1b[24m',
+};
+
+const BOX = { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', lt: '├', rt: '┤', tt: '┬', bt: '┴', x: '┼' };
+
+// Strip ANSI escape codes for length calculations
+function stripAnsi(str) {
+  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+}
+
+function visLen(str) {
+  return stripAnsi(str).length;
+}
+
+function padRight(str, len) {
+  const diff = len - visLen(str);
+  return diff > 0 ? str + ' '.repeat(diff) : str;
+}
+
+function padLeft(str, len) {
+  const diff = len - visLen(str);
+  return diff > 0 ? ' '.repeat(diff) + str : str;
+}
+
+function drawBox(title, contentLines, width) {
+  const inner = width - 4; // 2 for "│ " + 2 for " │"
+  const lines = [];
+  const titleStr = title ? ` ${title} ` : '';
+  const titleLen = visLen(titleStr);
+  const topDash = BOX.h.repeat(Math.max(1, inner + 2 - titleLen));
+  lines.push(`  ${BOX.tl}${c.dim}─${c.reset}${c.bold}${titleStr}${c.reset}${c.dim}${topDash}${c.reset}${BOX.tr}`);
+  for (const line of contentLines) {
+    lines.push(`  ${BOX.v} ${padRight(line, inner + 1)}${BOX.v}`);
+  }
+  lines.push(`  ${BOX.bl}${c.dim}${BOX.h.repeat(inner + 2)}${c.reset}${BOX.br}`);
+  return lines;
+}
+
+// ████████░░░░ proportional bar
+function renderBar(value, maxValue, maxWidth) {
+  if (maxValue <= 0 || value <= 0) return c.dim + '░'.repeat(maxWidth) + c.reset;
+  const filled = Math.min(Math.round((value / maxValue) * maxWidth), maxWidth);
+  const empty = maxWidth - filled;
+  return c.cyan + '█'.repeat(filled) + c.dim + '░'.repeat(empty) + c.reset;
+}
+
+// [████████░░] 89%
+function renderGauge(value, max, width) {
+  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+  const inner = width - 2; // subtract brackets
+  const filled = Math.min(Math.round((pct / 100) * inner), inner);
+  const empty = inner - filled;
+  const color = pct >= 80 ? c.green : pct >= 50 ? c.yellow : c.red;
+  return `[${color}${'█'.repeat(filled)}${c.dim}${'░'.repeat(empty)}${c.reset}] ${pct}%`;
+}
+
+// ●●●○○ colored severity dots
+function severityDots(breakdown) {
+  const parts = [];
+  const critical = breakdown?.critical || 0;
+  const high = breakdown?.high || 0;
+  const medium = breakdown?.medium || 0;
+  const low = breakdown?.low || 0;
+  for (let i = 0; i < Math.min(critical, 3); i++) parts.push(`${c.red}●${c.reset}`);
+  for (let i = 0; i < Math.min(high, 3); i++) parts.push(`${c.red}●${c.reset}`);
+  for (let i = 0; i < Math.min(medium, 2); i++) parts.push(`${c.yellow}●${c.reset}`);
+  for (let i = 0; i < Math.min(low, 2); i++) parts.push(`${c.blue}●${c.reset}`);
+  // fill remaining with empty dots up to 5
+  while (parts.length < 5) parts.push(`${c.dim}○${c.reset}`);
+  return parts.slice(0, 5).join('');
+}
+
+// ▁▂▃▅▇█▆▃ mini sparkline
+function sparkline(values) {
+  const chars = '▁▂▃▄▅▆▇█';
+  if (!values || values.length === 0) return '';
+  const max = Math.max(...values, 1);
+  return values.map(v => {
+    const idx = Math.min(Math.round((v / max) * (chars.length - 1)), chars.length - 1);
+    return chars[idx];
+  }).join('');
+}
+
+// ─── Section Header ─────────── labeled divider
+function sectionHeader(title, width = 60) {
+  const dashAfter = Math.max(3, width - 5 - title.length);
+  return `  ${c.dim}───${c.reset} ${c.bold}${title}${c.reset} ${c.dim}${'─'.repeat(dashAfter)}${c.reset}`;
+}
+
+// █████░░░░░░░░░░░░░░ coverage bar
+function coverageBar(filled, total, width = 20) {
+  if (total === 0) return `${c.dim}${'░'.repeat(width)}${c.reset}  0/0`;
+  const barFilled = Math.max(filled > 0 ? 1 : 0, Math.round((filled / total) * width));
+  const barEmpty = width - barFilled;
+  const pct = Math.round((filled / total) * 100);
+  const color = pct >= 80 ? c.green : pct >= 50 ? c.yellow : c.red;
+  return `${color}${'█'.repeat(barFilled)}${c.dim}${'░'.repeat(barEmpty)}${c.reset}  ${filled}/${total} (${pct}%)`;
+}
+
+// Severity histogram for findings
+function severityHistogram(findings) {
+  const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const f of findings) {
+    const sev = (f.severity || '').toLowerCase();
+    if (counts[sev] !== undefined) counts[sev]++;
+  }
+  const max = Math.max(...Object.values(counts), 1);
+  const lines = [];
+  for (const sev of ['critical', 'high', 'medium', 'low']) {
+    const count = counts[sev];
+    if (count === 0) continue;
+    const barLen = Math.max(1, Math.round((count / max) * 24));
+    const sc = severityColor(sev);
+    const label = sev.toUpperCase().padEnd(10);
+    lines.push(`  ${sc}${label}${c.reset} ${sc}${'█'.repeat(barLen)}${c.reset}${' '.repeat(24 - barLen)}  ${count}`);
+  }
+  return lines;
+}
+
+// ▰▰▰▱ step progress indicator
+function stepProgress(current, total) {
+  return `${c.cyan}${'▰'.repeat(current)}${c.dim}${'▱'.repeat(total - current)}${c.reset}`;
+}
+
+function fmtNum(n) {
+  if (n == null) return '0';
+  return n.toLocaleString('en-US');
+}
+
+function fmtPct(n) {
+  if (n == null) return '0%';
+  return Math.round(n) + '%';
+}
+
+function dashboardBanner() {
+  const ver = getVersion();
+  return [
+    `  ${BOX.tl}${c.dim}${BOX.h.repeat(35)}${c.reset}${BOX.tr}`,
+    `  ${BOX.v}  ${c.bold}${c.cyan}◆  AgentAudit${c.reset}  ${c.dim}v${ver}${c.reset}${' '.repeat(Math.max(0, 19 - ver.length))}${BOX.v}`,
+    `  ${BOX.v}  ${c.dim}Security Registry for AI Agents${c.reset}  ${BOX.v}`,
+    `  ${BOX.bl}${c.dim}${BOX.h.repeat(35)}${c.reset}${BOX.br}`,
+  ];
 }
 
 // ── File Collection (same logic as MCP server) ──────────
@@ -607,7 +859,7 @@ const SKIP_DIRS = new Set([
   'node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build',
   '.next', '.nuxt', 'coverage', '.pytest_cache', '.mypy_cache', 'vendor',
   'test', 'tests', '__tests__', 'spec', 'specs', 'docs', 'doc',
-  'examples', 'example', 'fixtures', '.github', '.vscode', '.idea',
+  'examples', 'example', 'fixtures', '.vscode', '.idea',
   'e2e', 'benchmark', 'benchmarks', '.tox', '.eggs', 'htmlcov',
 ]);
 const SKIP_EXTENSIONS = new Set([
@@ -628,6 +880,12 @@ function collectFiles(dir, basePath = '', collected = [], totalSize = { bytes: 0
     const relPath = basePath ? `${basePath}/${entry.name}` : entry.name;
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      // Special: scan .github/workflows/ (security-critical CI/CD files)
+      if (entry.name === '.github') {
+        const wfDir = path.join(fullPath, 'workflows');
+        try { if (fs.statSync(wfDir).isDirectory()) collectFiles(wfDir, relPath + '/workflows', collected, totalSize); } catch {}
+        continue;
+      }
       if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
       collectFiles(fullPath, relPath, collected, totalSize);
     } else {
@@ -661,7 +919,7 @@ function detectPackageInfo(repoPath, files) {
   
   // Detect package type
   const allContent = files.map(f => f.content).join('\n');
-  if (allContent.includes('@modelcontextprotocol') || allContent.includes('FastMCP') || allContent.includes('mcp.server') || allContent.includes('mcp_server')) {
+  if (allContent.includes('modelcontextprotocol') || allContent.includes('FastMCP') || allContent.includes('mcp.server') || allContent.includes('mcp_server') || allContent.includes('mcp-go')) {
     info.type = 'mcp-server';
   } else if (files.some(f => f.path.toLowerCase() === 'skill.md')) {
     info.type = 'agent-skill';
@@ -908,31 +1166,38 @@ function printScanResult(url, info, files, findings, registryData, duration) {
     console.log(`${icons.pipe}  ${c.dim}(no tools or prompts detected)${c.reset}`);
   }
   
-  // Findings
+  // Findings with severity stripe
   if (findings.length > 0) {
-    console.log(`${icons.pipe}`);
-    console.log(`${icons.pipe}  ${c.bold}Findings (${findings.length})${c.reset}  ${c.dim}static analysis — may include false positives${c.reset}`);
-    for (let i = 0; i < findings.length; i++) {
-      const f = findings[i];
-      const isLast = i === findings.length - 1;
-      const branch = isLast ? icons.treeLast : icons.tree;
-      const pipeOrSpace = isLast ? '   ' : `${icons.pipe}  `;
+    console.log();
+    console.log(sectionHeader(`Findings (${findings.length})`));
+    console.log(`  ${c.dim}static analysis — may include false positives${c.reset}`);
+    console.log();
+    for (const f of findings) {
       const sc = severityColor(f.severity);
-      console.log(`${branch}  ${severityIcon(f.severity)} ${sc}${f.severity.toUpperCase().padEnd(8)}${c.reset} ${f.title}`);
-      console.log(`${pipeOrSpace}   ${c.dim}${f.file}:${f.line}${c.reset}  ${c.dim}${f.snippet || ''}${c.reset}`);
+      console.log(`  ${sc}┃${c.reset} ${sc}${f.severity.toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}`);
+      console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.file}:${f.line}${c.reset}  ${c.dim}${f.snippet || ''}${c.reset}`);
+    }
+
+    // Severity histogram
+    const histLines = severityHistogram(findings);
+    if (histLines.length > 1) {
+      console.log();
+      console.log(sectionHeader('Severity'));
+      for (const line of histLines) console.log(line);
     }
   }
-  
+
   // Registry status
-  console.log(`${icons.pipe}`);
+  console.log();
+  console.log(sectionHeader('Registry'));
   if (registryData) {
     const rd = registryData;
     const riskScore = rd.risk_score ?? rd.latest_risk_score ?? 0;
-    console.log(`${icons.treeLast}  ${c.dim}registry${c.reset}  ${riskBadge(riskScore)} Risk ${riskScore}  ${c.dim}${REGISTRY_URL}/packages/${slug}${c.reset}`);
+    console.log(`  ${riskBadge(riskScore)}  ${c.dim}${REGISTRY_URL}/packages/${slug}${c.reset}`);
   } else {
-    console.log(`${icons.treeLast}  ${c.dim}registry${c.reset}  ${c.dim}not audited yet${c.reset}`);
+    console.log(`  ${c.dim}not audited yet${c.reset}`);
   }
-  
+
   console.log();
 }
 
@@ -941,27 +1206,23 @@ function printSummary(results) {
   const safe = results.filter(r => r.findings.length === 0).length;
   const withFindings = total - safe;
   const totalFindings = results.reduce((sum, r) => sum + r.findings.length, 0);
-  
-  console.log(`${c.dim}${'─'.repeat(60)}${c.reset}`);
-  console.log(`  ${c.bold}Summary${c.reset}  ${total} packages scanned`);
+  const allFindings = results.flatMap(r => r.findings);
+
+  console.log(sectionHeader(`Summary — ${total} packages scanned`));
   console.log();
   if (safe > 0) console.log(`  ${icons.safe}  ${c.green}${safe} clean${c.reset}`);
   if (withFindings > 0) console.log(`  ${icons.caution}  ${c.yellow}${withFindings} with findings${c.reset} (${totalFindings} total)`);
-  
-  // Breakdown by severity
-  const bySev = {};
-  results.forEach(r => r.findings.forEach(f => {
-    bySev[f.severity] = (bySev[f.severity] || 0) + 1;
-  }));
-  if (Object.keys(bySev).length > 0) {
+  console.log();
+  console.log(`  ${coverageBar(safe, total)}`);
+
+  // Severity histogram
+  const histLines = severityHistogram(allFindings);
+  if (histLines.length > 0) {
     console.log();
-    for (const sev of ['critical', 'high', 'medium', 'low']) {
-      if (bySev[sev]) {
-        console.log(`    ${severityIcon(sev)} ${bySev[sev]}× ${severityColor(sev)}${sev}${c.reset}`);
-      }
-    }
+    console.log(sectionHeader('Severity'));
+    for (const line of histLines) console.log(line);
   }
-  
+
   console.log();
 }
 
@@ -1018,48 +1279,290 @@ async function scanRepo(url) {
 
 // ── Discover local MCP configs ──────────────────────────
 
+/**
+ * Minimal YAML parser — extracts MCP server list entries from
+ * Continue.dev (mcpServers: list) and Goose (extensions: list).
+ * Zero dependencies. Only handles the subset of YAML used by these tools.
+ */
+function parseSimpleYaml(text, rootKey) {
+  const result = { mcpServers: {} };
+  const lines = text.split('\n');
+  let inSection = false;
+  let currentName = null;
+  let currentServer = {};
+  let collectingArgs = false;
+  let argsIndent = -1;
+
+  for (const line of lines) {
+    const trimmed = line.trimEnd();
+    if (trimmed === '' || /^\s*#/.test(trimmed)) continue;
+    const indent = line.search(/\S/);
+
+    if (indent === 0 && trimmed === rootKey + ':') { inSection = true; continue; }
+    if (indent === 0 && inSection && /^\w/.test(trimmed)) {
+      if (currentName) result.mcpServers[currentName] = currentServer;
+      break;
+    }
+    if (!inSection) continue;
+
+    const nameMatch = trimmed.match(/^\s*-\s+name:\s*(.+)/);
+    if (nameMatch) {
+      if (currentName) result.mcpServers[currentName] = currentServer;
+      currentName = nameMatch[1].replace(/^["']|["']$/g, '');
+      currentServer = {};
+      collectingArgs = false;
+      continue;
+    }
+
+    if (collectingArgs && indent > argsIndent) {
+      const argVal = trimmed.match(/^\s*-\s+(.+)/);
+      if (argVal) {
+        if (!currentServer.args) currentServer.args = [];
+        currentServer.args.push(argVal[1].replace(/^["']|["']$/g, ''));
+        continue;
+      }
+    }
+    if (collectingArgs && indent <= argsIndent) collectingArgs = false;
+    if (!currentName) continue;
+
+    const kvMatch = trimmed.match(/^\s+(command|cmd|type|url):\s*(.+)/);
+    if (kvMatch) {
+      collectingArgs = false;
+      const key = kvMatch[1] === 'cmd' ? 'command' : kvMatch[1];
+      currentServer[key] = kvMatch[2].replace(/^["']|["']$/g, '');
+      continue;
+    }
+
+    const argsMatch = trimmed.match(/^\s+(args):\s*(.*)/);
+    if (argsMatch) {
+      const inlineArr = argsMatch[2].match(/^\[(.+)\]$/);
+      if (inlineArr) {
+        currentServer.args = inlineArr[1].split(',').map(s => s.trim().replace(/^["']|["']$/g, ''));
+        collectingArgs = false;
+      } else {
+        collectingArgs = true;
+        argsIndent = indent;
+        currentServer.args = [];
+      }
+      continue;
+    }
+  }
+  if (currentName) result.mcpServers[currentName] = currentServer;
+  return result;
+}
+
+/**
+ * Minimal TOML parser — extracts [mcp_servers.xxx] sections
+ * from OpenAI Codex CLI config. Zero dependencies.
+ */
+function parseSimpleToml(text) {
+  const result = { mcpServers: {} };
+  const lines = text.split('\n');
+  let currentName = null;
+  let currentServer = {};
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '' || trimmed.startsWith('#')) continue;
+
+    const sectionMatch = trimmed.match(/^\[mcp_servers\.(.+)\]$/);
+    if (sectionMatch) {
+      if (currentName) result.mcpServers[currentName] = currentServer;
+      currentName = sectionMatch[1];
+      currentServer = {};
+      continue;
+    }
+    if (trimmed.startsWith('[') && !trimmed.startsWith('[mcp_servers.')) {
+      if (currentName) result.mcpServers[currentName] = currentServer;
+      currentName = null;
+      continue;
+    }
+    if (!currentName) continue;
+
+    const strMatch = trimmed.match(/^(command|url)\s*=\s*"(.+?)"/);
+    if (strMatch) { currentServer[strMatch[1]] = strMatch[2]; continue; }
+
+    const argsMatch = trimmed.match(/^args\s*=\s*\[(.+)\]/);
+    if (argsMatch) {
+      currentServer.args = argsMatch[1].split(',').map(s => s.trim().replace(/^["']|["']$/g, ''));
+      continue;
+    }
+
+    const boolMatch = trimmed.match(/^enabled\s*=\s*(true|false)/);
+    if (boolMatch && boolMatch[1] === 'false') currentServer.disabled = true;
+  }
+  if (currentName) result.mcpServers[currentName] = currentServer;
+  return result;
+}
+
+/**
+ * Comprehensive MCP config discovery across all major AI editors & tools.
+ *
+ * Supports: Claude Desktop, Claude Code, Cursor, Windsurf, VS Code,
+ * Cline, Roo Code, Amazon Q, Gemini CLI, Zed, Continue.dev, Goose,
+ * OpenAI Codex CLI, Visual Studio — global + project-level configs.
+ */
 function findMcpConfigs() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const platform = process.platform;
-  
-  // All known MCP config locations
-  const candidates = [
-    // Claude Desktop
-    { name: 'Claude Desktop', path: path.join(home, '.claude', 'mcp.json') },
-    { name: 'Claude Desktop', path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') },
-    { name: 'Claude Desktop', path: path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json') },
-    { name: 'Claude Desktop', path: path.join(home, '.config', 'claude', 'claude_desktop_config.json') },
-    // Cursor
-    { name: 'Cursor', path: path.join(home, '.cursor', 'mcp.json') },
-    // Windsurf / Codeium
-    { name: 'Windsurf', path: path.join(home, '.codeium', 'windsurf', 'mcp_config.json') },
-    // VS Code
-    { name: 'VS Code', path: path.join(home, '.vscode', 'mcp.json') },
-    // Continue.dev
-    { name: 'Continue', path: path.join(home, '.continue', 'config.json') },
-  ];
-  
-  // Also check AGENTAUDIT_TEST_CONFIG env for testing
-  if (process.env.AGENTAUDIT_TEST_CONFIG) {
-    candidates.push({ name: 'Test Config', path: process.env.AGENTAUDIT_TEST_CONFIG });
-  }
-  
-  // Also scan workspace .cursor/mcp.json, .vscode/mcp.json in cwd
   const cwd = process.cwd();
-  candidates.push(
-    { name: 'Cursor (project)', path: path.join(cwd, '.cursor', 'mcp.json') },
-    { name: 'VS Code (project)', path: path.join(cwd, '.vscode', 'mcp.json') },
-  );
-  
-  const found = [];
-  for (const c of candidates) {
-    if (fs.existsSync(c.path)) {
-      try {
-        const content = JSON.parse(fs.readFileSync(c.path, 'utf8'));
-        found.push({ ...c, content });
-      } catch {}
-    }
+  const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+
+  // Platform-specific app data directory
+  // macOS: ~/Library/Application Support, Windows: ~/AppData/Roaming, Linux: ~/.config
+  const appData = platform === 'darwin'
+    ? path.join(home, 'Library', 'Application Support')
+    : platform === 'win32'
+    ? path.join(home, 'AppData', 'Roaming')
+    : xdgConfig;
+
+  // Each candidate: { name, path, format: 'json'|'yaml'|'toml', key: top-level key }
+  const candidates = [
+    // ── Claude Desktop ──
+    ...(platform === 'darwin' ? [{ name: 'Claude Desktop', path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'win32'  ? [{ name: 'Claude Desktop', path: path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'Claude Desktop', path: path.join(xdgConfig, 'Claude', 'claude_desktop_config.json'), format: 'json', key: 'mcpServers' }] : []),
+
+    // ── Claude Code ──
+    { name: 'Claude Code', path: path.join(home, '.claude.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Claude Code', path: path.join(home, '.claude', 'mcp.json'), format: 'json', key: 'mcpServers' },
+
+    // ── Cursor (global) ──
+    { name: 'Cursor', path: path.join(home, '.cursor', 'mcp.json'), format: 'json', key: 'mcpServers' },
+
+    // ── Windsurf / Codeium ──
+    { name: 'Windsurf', path: path.join(home, '.codeium', 'windsurf', 'mcp_config.json'), format: 'json', key: 'mcpServers' },
+
+    // ── VS Code (global mcp.json — uses 'servers' key) ──
+    ...(platform === 'darwin' ? [{ name: 'VS Code', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json'), format: 'json', key: 'servers' }] : []),
+    ...(platform === 'win32'  ? [{ name: 'VS Code', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'mcp.json'), format: 'json', key: 'servers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'VS Code', path: path.join(xdgConfig, 'Code', 'User', 'mcp.json'), format: 'json', key: 'servers' }] : []),
+
+    // ── VS Code settings.json (mcp.servers nested key) ──
+    ...(platform === 'darwin' ? [{ name: 'VS Code (settings)', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'settings.json'), format: 'json', key: 'mcp.servers' }] : []),
+    ...(platform === 'win32'  ? [{ name: 'VS Code (settings)', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'settings.json'), format: 'json', key: 'mcp.servers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'VS Code (settings)', path: path.join(xdgConfig, 'Code', 'User', 'settings.json'), format: 'json', key: 'mcp.servers' }] : []),
+
+    // ── Cline (VS Code extension) ──
+    ...(platform === 'darwin' ? [{ name: 'Cline', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'win32'  ? [{ name: 'Cline', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'Cline', path: path.join(xdgConfig, 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+
+    // ── Roo Code (VS Code extension) ──
+    ...(platform === 'darwin' ? [{ name: 'Roo Code', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'win32'  ? [{ name: 'Roo Code', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'Roo Code', path: path.join(xdgConfig, 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json'), format: 'json', key: 'mcpServers' }] : []),
+
+    // ── Amazon Q Developer ──
+    { name: 'Amazon Q', path: path.join(home, '.aws', 'amazonq', 'mcp.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Amazon Q (IDE)', path: path.join(home, '.aws', 'amazonq', 'default.json'), format: 'json', key: 'mcpServers' },
+
+    // ── Gemini CLI ──
+    { name: 'Gemini CLI', path: path.join(home, '.gemini', 'settings.json'), format: 'json', key: 'mcpServers' },
+
+    // ── Zed (macOS + Linux only, uses 'context_servers' key) ──
+    ...(platform === 'darwin' ? [{ name: 'Zed', path: path.join(home, '.zed', 'settings.json'), format: 'json', key: 'context_servers' }] : []),
+    ...(platform === 'linux'  ? [{ name: 'Zed', path: path.join(xdgConfig, 'zed', 'settings.json'), format: 'json', key: 'context_servers' }] : []),
+
+    // ── Continue.dev ──
+    { name: 'Continue', path: path.join(home, '.continue', 'config.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Continue', path: path.join(home, '.continue', 'config.yaml'), format: 'yaml', key: 'mcpServers' },
+
+    // ── Goose (Block/Square) ──
+    { name: 'Goose', path: path.join(xdgConfig, 'goose', 'config.yaml'), format: 'yaml', key: 'extensions' },
+
+    // ── OpenAI Codex CLI ──
+    { name: 'Codex CLI', path: path.join(home, '.codex', 'config.toml'), format: 'toml', key: 'mcp_servers' },
+
+    // ── Visual Studio (Windows only) ──
+    ...(platform === 'win32' ? [{ name: 'Visual Studio', path: path.join(home, '.mcp.json'), format: 'json', key: 'mcpServers' }] : []),
+
+    // ── Project-level configs (cwd) ──
+    { name: 'Claude Code (project)', path: path.join(cwd, '.mcp.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Cursor (project)', path: path.join(cwd, '.cursor', 'mcp.json'), format: 'json', key: 'mcpServers' },
+    { name: 'VS Code (project)', path: path.join(cwd, '.vscode', 'mcp.json'), format: 'json', key: 'servers' },
+    { name: 'Roo Code (project)', path: path.join(cwd, '.roo', 'mcp.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Amazon Q (project)', path: path.join(cwd, '.amazonq', 'mcp.json'), format: 'json', key: 'mcpServers' },
+    { name: 'Gemini CLI (project)', path: path.join(cwd, '.gemini', 'settings.json'), format: 'json', key: 'mcpServers' },
+    ...(platform !== 'win32' ? [{ name: 'Zed (project)', path: path.join(cwd, '.zed', 'settings.json'), format: 'json', key: 'context_servers' }] : []),
+    { name: 'Codex CLI (project)', path: path.join(cwd, '.codex', 'config.toml'), format: 'toml', key: 'mcp_servers' },
+  ];
+
+  // Test config override
+  if (process.env.AGENTAUDIT_TEST_CONFIG) {
+    candidates.push({ name: 'Test Config', path: process.env.AGENTAUDIT_TEST_CONFIG, format: 'json', key: 'mcpServers' });
   }
+
+  // Continue.dev mcpServers drop-in directory (individual JSON files)
+  const continueDropIn = path.join(home, '.continue', 'mcpServers');
+  try {
+    if (fs.existsSync(continueDropIn)) {
+      for (const f of fs.readdirSync(continueDropIn)) {
+        if (f.endsWith('.json')) {
+          candidates.push({ name: 'Continue (drop-in)', path: path.join(continueDropIn, f), format: 'json', key: 'mcpServers' });
+        }
+      }
+    }
+  } catch {}
+
+  // Project-level Continue.dev drop-ins
+  const cwdContinueDropIn = path.join(cwd, '.continue', 'mcpServers');
+  try {
+    if (fs.existsSync(cwdContinueDropIn)) {
+      for (const f of fs.readdirSync(cwdContinueDropIn)) {
+        if (f.endsWith('.json')) {
+          candidates.push({ name: 'Continue (project drop-in)', path: path.join(cwdContinueDropIn, f), format: 'json', key: 'mcpServers' });
+        }
+      }
+    }
+  } catch {}
+
+  const found = [];
+  const seenPaths = new Set();
+
+  for (const c of candidates) {
+    const resolved = path.resolve(c.path);
+    if (seenPaths.has(resolved)) continue;
+    if (!fs.existsSync(c.path)) continue;
+    seenPaths.add(resolved);
+
+    try {
+      const raw = fs.readFileSync(c.path, 'utf8');
+      let content;
+
+      if (c.format === 'yaml') {
+        content = parseSimpleYaml(raw, c.key);
+      } else if (c.format === 'toml') {
+        content = parseSimpleToml(raw);
+      } else {
+        content = JSON.parse(raw);
+        // Normalize different JSON key structures to mcpServers
+        if (c.key === 'mcp.servers' && content.mcp?.servers) {
+          content = { mcpServers: content.mcp.servers };
+        } else if (c.key === 'context_servers' && content.context_servers) {
+          // Zed: normalize nested { command: { path, args } } → { command, args }
+          const normalized = {};
+          for (const [name, cfg] of Object.entries(content.context_servers)) {
+            if (cfg.command && typeof cfg.command === 'object') {
+              normalized[name] = { command: cfg.command.path || cfg.command.command, args: cfg.command.args || [], env: cfg.command.env || {} };
+            } else {
+              normalized[name] = cfg;
+            }
+          }
+          content = { mcpServers: normalized };
+        } else if (c.key === 'servers' && content.servers && !content.mcpServers) {
+          content = { mcpServers: content.servers };
+        }
+      }
+
+      // Only include configs that actually have servers
+      const servers = content?.mcpServers || content?.servers || {};
+      if (Object.keys(servers).length > 0) {
+        found.push({ name: c.name, path: c.path, content });
+      }
+    } catch {}
+  }
+
   return found;
 }
 
@@ -1238,7 +1741,7 @@ async function discoverCommand(options = {}) {
   const interactiveAudit = options.audit || false;
   
   if (!jsonMode) {
-    console.log(`  ${c.bold}Discovering MCP servers in your AI editors...${c.reset}`);
+    console.log(`  ${c.bold}Discovering MCP servers across all AI tools...${c.reset}`);
     console.log();
   }
   
@@ -1246,13 +1749,16 @@ async function discoverCommand(options = {}) {
   
   if (configs.length === 0) {
     console.log(`  ${c.yellow}No MCP configurations found.${c.reset}`);
-    console.log(`  ${c.dim}Searched: Claude Desktop, Cursor, Windsurf, VS Code${c.reset}`);
+    console.log(`  ${c.dim}Searched 15+ tools: Claude Desktop, Claude Code, Cursor, Windsurf, VS Code,${c.reset}`);
+    console.log(`  ${c.dim}Cline, Roo Code, Amazon Q, Gemini CLI, Zed, Continue.dev, Goose, Codex CLI${c.reset}`);
     console.log();
-    console.log(`  ${c.dim}MCP config locations:${c.reset}`);
-    console.log(`  ${c.dim}  Claude:   ~/.claude/mcp.json${c.reset}`);
-    console.log(`  ${c.dim}  Cursor:   ~/.cursor/mcp.json${c.reset}`);
-    console.log(`  ${c.dim}  Windsurf: ~/.codeium/windsurf/mcp_config.json${c.reset}`);
-    console.log(`  ${c.dim}  VS Code:  ~/.vscode/mcp.json${c.reset}`);
+    console.log(`  ${c.dim}Common MCP config locations:${c.reset}`);
+    console.log(`  ${c.dim}  Claude Desktop:  ~/Library/Application Support/Claude/claude_desktop_config.json${c.reset}`);
+    console.log(`  ${c.dim}  Claude Code:     ~/.claude.json${c.reset}`);
+    console.log(`  ${c.dim}  Cursor:          ~/.cursor/mcp.json${c.reset}`);
+    console.log(`  ${c.dim}  Windsurf:        ~/.codeium/windsurf/mcp_config.json${c.reset}`);
+    console.log(`  ${c.dim}  VS Code:         (platform)/Code/User/mcp.json${c.reset}`);
+    console.log(`  ${c.dim}  Project-level:   .mcp.json / .cursor/mcp.json / .vscode/mcp.json${c.reset}`);
     console.log();
     return;
   }
@@ -1315,7 +1821,7 @@ async function discoverCommand(options = {}) {
         const riskScore = regData.risk_score ?? regData.latest_risk_score ?? 0;
         const hasOfficial = regData.has_official_audit;
         console.log(`${branch}  ${c.bold}${server.name}${c.reset}    ${sourceLabel}`);
-        console.log(`${pipe}  ${riskBadge(riskScore)} Risk ${riskScore}  ${hasOfficial ? `${c.green}✔ official${c.reset}  ` : ''}${c.dim}${REGISTRY_URL}/packages/${slug}${c.reset}`);
+        console.log(`${pipe}  ${riskBadge(riskScore)}  ${hasOfficial ? `${c.green}✔ official${c.reset}  ` : ''}${c.dim}${REGISTRY_URL}/packages/${slug}${c.reset}`);
         if (resolvedUrl) allServersWithUrls.push({ name: server.name, sourceUrl: resolvedUrl, hasAudit: true, regData });
       } else {
         unauditedServers++;
@@ -1338,11 +1844,14 @@ async function discoverCommand(options = {}) {
   }
   
   // Summary
-  console.log(`${c.dim}${'─'.repeat(60)}${c.reset}`);
-  console.log(`  ${c.bold}Summary${c.reset}  ${totalServers} server${totalServers !== 1 ? 's' : ''} across ${configs.length} config${configs.length !== 1 ? 's' : ''}`);
+  console.log(sectionHeader(`Summary — ${totalServers} server${totalServers !== 1 ? 's' : ''} across ${configs.length} config${configs.length !== 1 ? 's' : ''}`));
   console.log();
   if (auditedServers > 0) console.log(`  ${icons.safe}  ${c.green}${auditedServers} audited${c.reset}`);
   if (unauditedServers > 0) console.log(`  ${icons.caution}  ${c.yellow}${unauditedServers} not audited${c.reset}`);
+  if (totalServers > 0) {
+    console.log();
+    console.log(`  ${coverageBar(auditedServers, totalServers)}`);
+  }
   console.log();
   
   // --scan: automatically scan all servers with resolved source URLs (git-cloneable only)
@@ -1358,8 +1867,8 @@ async function discoverCommand(options = {}) {
     });
     const skipped = allServersWithUrls.filter(s => s.sourceUrl && !isCloneable(s.sourceUrl));
     if (dedupedTargets.length > 0) {
-      console.log(`${c.dim}${'─'.repeat(60)}${c.reset}`);
-      console.log(`  ${c.bold}${icons.scan}  Auto-scanning ${dedupedTargets.length} server${dedupedTargets.length !== 1 ? 's' : ''}...${c.reset}`);
+      console.log(sectionHeader(`Auto-scanning ${dedupedTargets.length} server${dedupedTargets.length !== 1 ? 's' : ''}`));
+      console.log(`  ${c.bold}${icons.scan}  Starting scans...${c.reset}`);
       if (skipped.length > 0) {
         console.log(`  ${c.dim}(${skipped.length} skipped — no cloneable source URL)${c.reset}`);
       }
@@ -1373,8 +1882,7 @@ async function discoverCommand(options = {}) {
       
       if (scanResults.length > 1) {
         // Print combined scan summary
-        console.log(`${c.dim}${'─'.repeat(60)}${c.reset}`);
-        console.log(`  ${c.bold}Scan Summary${c.reset}  ${scanResults.length} server${scanResults.length !== 1 ? 's' : ''} scanned`);
+        console.log(sectionHeader(`Scan Summary — ${scanResults.length} server${scanResults.length !== 1 ? 's' : ''} scanned`));
         console.log();
         
         let totalFindings = 0;
@@ -1483,7 +1991,7 @@ async function auditRepo(url) {
   console.log();
   
   // Step 1: Clone
-  process.stdout.write(`  ${c.dim}[1/4]${c.reset} Cloning repository...`);
+  process.stdout.write(`  ${stepProgress(1, 4)} Cloning repository...`);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentaudit-'));
   const repoPath = path.join(tmpDir, 'repo');
   try {
@@ -1498,12 +2006,12 @@ async function auditRepo(url) {
   }
   
   // Step 2: Collect files
-  process.stdout.write(`  ${c.dim}[2/4]${c.reset} Collecting source files...`);
+  process.stdout.write(`  ${stepProgress(2, 4)} Collecting source files...`);
   const files = collectFiles(repoPath);
   console.log(` ${c.green}${files.length} files${c.reset}`);
   
   // Step 3: Build audit payload
-  process.stdout.write(`  ${c.dim}[3/4]${c.reset} Preparing audit payload...`);
+  process.stdout.write(`  ${stepProgress(3, 4)} Preparing audit payload...`);
   const auditPrompt = loadAuditPrompt();
   
   let codeBlock = '';
@@ -1513,8 +2021,8 @@ async function auditRepo(url) {
   console.log(` ${c.green}done${c.reset}`);
   
   // Step 4: LLM Analysis
-  // Detect provider from environment variables (first match wins)
-  const activeLlm = LLM_PROVIDERS.find(p => process.env[p.key]);
+  // Resolve provider: preferred_provider from config → first match fallback
+  const activeLlm = resolveProvider();
   const llmApiKey = activeLlm ? process.env[activeLlm.key] : null;
   const activeProvider = activeLlm ? activeLlm.name : null;
 
@@ -1529,34 +2037,16 @@ async function auditRepo(url) {
   }
   
   if (!activeLlm) {
-    // No LLM API key — clear explanation
+    // No LLM API key — compact explanation
     console.log();
     console.log(`  ${c.yellow}No LLM API key found.${c.reset} The ${c.bold}audit${c.reset} command needs an LLM to analyze code.`);
     console.log();
-    console.log(`  ${c.bold}Option 1: Set an API key${c.reset} (any one of these):`);
-    console.log(`  ${c.cyan}ANTHROPIC_API_KEY${c.reset}    Anthropic Claude`);
-    console.log(`  ${c.cyan}OPENAI_API_KEY${c.reset}       OpenAI GPT-4o`);
-    console.log(`  ${c.cyan}GEMINI_API_KEY${c.reset}       Google Gemini`);
-    console.log(`  ${c.cyan}DEEPSEEK_API_KEY${c.reset}     DeepSeek`);
-    console.log(`  ${c.cyan}MISTRAL_API_KEY${c.reset}      Mistral`);
-    console.log(`  ${c.cyan}XAI_API_KEY${c.reset}          xAI Grok`);
-    console.log(`  ${c.cyan}GROQ_API_KEY${c.reset}         Groq`);
-    console.log(`  ${c.cyan}TOGETHER_API_KEY${c.reset}     Together AI`);
-    console.log(`  ${c.cyan}FIREWORKS_API_KEY${c.reset}    Fireworks AI`);
-    console.log(`  ${c.cyan}CEREBRAS_API_KEY${c.reset}     Cerebras`);
-    console.log(`  ${c.cyan}ZAI_API_KEY${c.reset}          Zhipu AI (GLM)`);
-    console.log(`  ${c.cyan}OPENROUTER_API_KEY${c.reset}   OpenRouter (any model)`);
+    console.log(`  ${c.bold}Set an API key${c.reset} (e.g. ${c.cyan}export OPENROUTER_API_KEY=sk-or-...${c.reset})`);
+    console.log(`  ${c.dim}Run "agentaudit model" to configure provider + model interactively${c.reset}`);
     console.log();
-    console.log(`  ${c.dim}export ANTHROPIC_API_KEY=sk-ant-...${c.reset}`);
-    console.log(`  ${c.dim}export OPENAI_API_KEY=sk-...${c.reset}`);
-    console.log();
-    console.log(`  ${c.bold}Option 2: Export for manual review${c.reset}`);
-    console.log(`  ${c.cyan}agentaudit audit ${url} --export${c.reset}`);
-    console.log(`  ${c.dim}Creates a markdown file you can paste into any LLM${c.reset}`);
-    console.log();
-    console.log(`  ${c.bold}Option 3: Use MCP in Claude/Cursor/Windsurf (no API key needed)${c.reset}`);
-    console.log(`  ${c.dim}Add AgentAudit as MCP server — your editor's agent runs the audit using its own LLM.${c.reset}`);
-    console.log(`  ${c.dim}Config: { "mcpServers": { "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } } }${c.reset}`);
+    console.log(`  ${c.bold}Or export for manual review:${c.reset} ${c.cyan}agentaudit audit ${url} --export${c.reset}`);
+    console.log(`  ${c.bold}Or use as MCP server${c.reset} in Cursor/Claude ${c.dim}(no extra API key needed)${c.reset}`);
+    console.log(`  ${c.dim}{ "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } }${c.reset}`);
     console.log();
     
     // Check if --export flag
@@ -1594,17 +2084,18 @@ async function auditRepo(url) {
   
   // We have an API key — run LLM audit
   const modelLabel = modelOverride ? `${activeProvider} → ${activeLlm.model}` : activeProvider;
-  process.stdout.write(`  ${c.dim}[4/4]${c.reset} Running LLM analysis ${c.dim}(${modelLabel})${c.reset}...`);
+  process.stdout.write(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${modelLabel})${c.reset}...`);
 
   const systemPrompt = auditPrompt || 'You are a security auditor. Analyze the code and report findings as JSON.';
   const userMessage = [
     `Audit this package: **${slug}** (${url})`,
     ``,
     `After analysis, respond with ONLY a valid JSON object. No markdown fences, no explanation, no text before or after. Just the raw JSON:`,
-    `{ "skill_slug": "${slug}", "source_url": "${url}", "package_type": "<mcp-server|agent-skill|library|cli-tool>",`,
+    `{ "skill_slug": "${slug}", "source_url": "${url}", "package_type": "<mcp-server|agent-skill|library|cli-tool|other>",`,
     `  "risk_score": <0-100>, "result": "<safe|caution|unsafe>", "max_severity": "<none|low|medium|high|critical>",`,
-    `  "findings_count": <n>, "findings": [{ "id": "...", "title": "...", "severity": "...", "category": "...",`,
-    `  "description": "...", "file": "...", "line": <n>, "remediation": "...", "confidence": "...", "is_by_design": false }] }`,
+    `  "findings_count": <n>, "findings": [{ "pattern_id": "CMD_INJECT_001", "title": "...", "severity": "...", "category": "...",`,
+    `  "cwe_id": "CWE-78", "description": "...", "file": "...", "line": <n>, "content": "...", "remediation": "...",`,
+    `  "confidence": "high|medium|low", "by_design": false, "score_impact": -15 }] }`,
     ``,
     `## Source Code`,
     codeBlock,
@@ -1758,9 +2249,27 @@ async function auditRepo(url) {
     return null;
   }
   
-  // Cleanup repo
+  // Provenance: compute BEFORE cleanup (needs repoPath on disk)
+  let commitSha = '';
+  try {
+    commitSha = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
+  } catch { /* shallow clone without HEAD — unlikely but safe */ }
+  const sourceHash = crypto.createHash('sha256').update(
+    files.slice().sort((a, b) => a.path.localeCompare(b.path))
+      .map(f => f.path + '\n' + f.content).join('\n')
+  ).digest('hex');
+  // Code-based type detection (uses files array in memory + repoPath for context)
+  const pkgInfo = detectPackageInfo(repoPath, files);
+  // Known MCP frameworks are libraries, not servers (they contain MCP patterns but ARE the SDK)
+  const KNOWN_MCP_LIBS = new Set(['fastmcp', 'jlowin-fastmcp', 'mcp-go', 'fastapi-mcp', 'fastapi_mcp', 'mcp-use', 'mcp-agent']);
+  const KNOWN_CLI = new Set(['mcp-cli', 'mcp-scan', 'inspector']);
+  let detectedType = pkgInfo.type === 'unknown' ? 'other' : pkgInfo.type;
+  if (KNOWN_MCP_LIBS.has(slug)) detectedType = 'library';
+  if (KNOWN_CLI.has(slug)) detectedType = 'cli-tool';
+
+  // Cleanup repo (safe now — provenance data captured above)
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-  
+
   if (!report) {
     console.log(`  ${c.red}Could not parse LLM response as JSON${c.reset}`);
     console.log(`  ${c.dim}Hint: run with --debug to see the raw LLM response${c.reset}`);
@@ -1771,21 +2280,44 @@ async function auditRepo(url) {
     }
     return null;
   }
-  
+
+  // Force slug from URL — never trust LLM-provided skill_slug
+  report.skill_slug = slug;
+
+  // Force package_type from code detection — never trust LLM-provided type
+  report.package_type = detectedType;
+
+  // Add scan metadata for benchmarking
+  report.audit_duration_ms = Date.now() - start;
+  report.files_scanned = files.length;
+
+  // Set provenance data
+  if (commitSha) report.commit_sha = commitSha;
+  report.source_hash = sourceHash;
+
   // Display results
   console.log();
   const riskScore = report.risk_score || 0;
-  console.log(`  ${riskBadge(riskScore)} Risk ${riskScore}/100  ${c.bold}${report.result || 'unknown'}${c.reset}`);
+  console.log(sectionHeader('Result'));
+  console.log(`  ${riskBadge(riskScore)}`);
   console.log();
-  
+
   if (report.findings && report.findings.length > 0) {
-    console.log(`  ${c.bold}Findings (${report.findings.length})${c.reset}`);
+    console.log(sectionHeader(`Findings (${report.findings.length})`));
     console.log();
     for (const f of report.findings) {
       const sc = severityColor(f.severity);
-      console.log(`  ${severityIcon(f.severity)} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset} ${f.title}`);
-      if (f.file) console.log(`    ${c.dim}${f.file}${f.line ? ':' + f.line : ''}${c.reset}`);
-      if (f.description) console.log(`    ${c.dim}${f.description.slice(0, 120)}${c.reset}`);
+      console.log(`  ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}`);
+      if (f.file) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.file}${f.line ? ':' + f.line : ''}${c.reset}`);
+      if (f.description) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.description.slice(0, 120)}${c.reset}`);
+      console.log();
+    }
+
+    // Severity histogram
+    const histLines = severityHistogram(report.findings);
+    if (histLines.length > 1) {
+      console.log(sectionHeader('Severity'));
+      for (const line of histLines) console.log(line);
       console.log();
     }
   } else {
@@ -1793,9 +2325,12 @@ async function auditRepo(url) {
     console.log();
   }
   
-  // Upload to registry
-  const creds = loadCredentials();
-  if (creds) {
+  // Upload to registry (skip with --no-upload)
+  const noUpload = process.argv.includes('--no-upload');
+  let creds = loadCredentials();
+  if (noUpload) {
+    // Skip silently
+  } else if (creds) {
     process.stdout.write(`  Uploading report to registry...`);
     try {
       const res = await fetch(`${REGISTRY_URL}/api/reports`, {
@@ -1812,13 +2347,59 @@ async function auditRepo(url) {
         console.log(` ${c.green}done${c.reset}`);
         console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
       } else {
+        let errBody = '';
+        try { errBody = await res.text(); } catch {}
         console.log(` ${c.yellow}failed (HTTP ${res.status})${c.reset}`);
+        if (errBody && process.argv.includes('--debug')) {
+          console.log(`  ${c.dim}Server: ${errBody.slice(0, 300)}${c.reset}`);
+        }
       }
     } catch (err) {
       console.log(` ${c.yellow}failed${c.reset}`);
     }
+  } else if (process.stdin.isTTY) {
+    // No credentials — prompt to paste key or set up
+    console.log();
+    console.log(`  ${c.bold}Want to upload this report to agentaudit.dev?${c.reset}`);
+    console.log(`  ${c.dim}Create an API key at ${c.cyan}${REGISTRY_URL}/profile${c.dim} (sign in with GitHub)${c.reset}`);
+    console.log();
+    const pastedKey = await askQuestion(`  Paste API key ${c.dim}(or Enter to skip)${c.reset}: `);
+    if (pastedKey && pastedKey.trim()) {
+      process.stdout.write(`  Validating...`);
+      const validation = await validateApiKey(pastedKey.trim());
+      if (validation.valid) {
+        const agentName = validation.agent_name || 'agent';
+        saveCredentials({ api_key: pastedKey.trim(), agent_name: agentName });
+        creds = { api_key: pastedKey.trim(), agent_name: agentName };
+        console.log(` ${c.green}valid!${c.reset}`);
+        process.stdout.write(`  Uploading report...`);
+        try {
+          const res = await fetch(`${REGISTRY_URL}/api/reports`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${creds.api_key}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(report),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (res.ok) {
+            console.log(` ${c.green}done${c.reset}`);
+            console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${slug}${c.reset}`);
+          } else {
+            console.log(` ${c.yellow}failed (HTTP ${res.status})${c.reset}`);
+          }
+        } catch (err) {
+          console.log(` ${c.red}failed${c.reset}`);
+          console.log(`  ${c.dim}${err.message}${c.reset}`);
+        }
+      } else {
+        console.log(` ${c.red}invalid key${c.reset}`);
+        console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to configure.${c.reset}`);
+      }
+    }
   } else {
-    console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to upload reports to the registry${c.reset}`);
+    console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to configure your API key and upload reports${c.reset}`);
   }
   
   console.log();
@@ -1854,6 +2435,835 @@ async function checkPackage(name) {
   return data;
 }
 
+// ── Dashboard / Leaderboard / Benchmark Commands ────────
+
+async function fetchDashboardData() {
+  const creds = loadCredentials();
+  const fetches = [
+    fetch(`${REGISTRY_URL}/api/stats`, { signal: AbortSignal.timeout(15_000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(`${REGISTRY_URL}/api/leaderboard?limit=50`, { signal: AbortSignal.timeout(15_000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(`${REGISTRY_URL}/api/benchmark`, { signal: AbortSignal.timeout(15_000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+  ];
+  if (creds?.agent_name && creds.agent_name !== 'env') {
+    fetches.push(
+      fetch(`${REGISTRY_URL}/api/agents/${encodeURIComponent(creds.agent_name)}`, {
+        headers: { 'Authorization': `Bearer ${creds.api_key}` },
+        signal: AbortSignal.timeout(15_000),
+      }).then(r => r.ok ? r.json() : null).catch(() => null)
+    );
+  } else {
+    fetches.push(Promise.resolve(null));
+  }
+  const [stats, leaderboard, benchmark, agent] = await Promise.all(fetches);
+  // Update profile cache if we have agent data
+  if (agent && creds) {
+    let rank = null;
+    if (Array.isArray(leaderboard)) {
+      const idx = leaderboard.findIndex(e => e.agent_name === creds.agent_name);
+      if (idx >= 0) rank = idx + 1;
+    }
+    saveProfileCache({
+      agent_name: creds.agent_name,
+      rank,
+      total_points: agent.total_points || 0,
+      total_reports: agent.total_reports || 0,
+    });
+  }
+  return { stats, leaderboard, benchmark, agent, creds };
+}
+
+function renderOverviewTab(data, width) {
+  const { stats, agent, leaderboard, creds } = data;
+  const lines = [];
+  const halfW = Math.min(Math.floor((width - 6) / 2), 40);
+
+  // Profile box
+  const profileLines = [];
+  if (agent && creds) {
+    // Find rank
+    let rank = '-';
+    if (leaderboard && Array.isArray(leaderboard)) {
+      const idx = leaderboard.findIndex(e => e.agent_name === creds.agent_name);
+      if (idx >= 0) rank = `#${idx + 1} of ${leaderboard.length}`;
+    }
+    profileLines.push(`${c.bold}${creds.agent_name}${c.reset}${' '.repeat(Math.max(1, halfW - 14 - visLen(creds.agent_name) - visLen(rank)))}${c.dim}${rank}${c.reset}`);
+    profileLines.push(`Points     ${c.bold}${fmtNum(agent.total_points)}${c.reset}`);
+    profileLines.push(`Audits     ${c.bold}${fmtNum(agent.total_reports)}${c.reset}`);
+    profileLines.push(`Findings   ${c.bold}${fmtNum(agent.total_findings_submitted)}${c.reset} ${c.dim}(${fmtNum(agent.total_findings_confirmed)} confirmed)${c.reset}`);
+    const sev = agent.severity_breakdown || {};
+    profileLines.push('');
+    const sevParts = [];
+    if (sev.critical) sevParts.push(`${c.red}${sev.critical} crit${c.reset}`);
+    if (sev.high) sevParts.push(`${c.red}${sev.high} high${c.reset}`);
+    if (sev.medium) sevParts.push(`${c.yellow}${sev.medium} med${c.reset}`);
+    if (sev.low) sevParts.push(`${c.blue}${sev.low} low${c.reset}`);
+    profileLines.push(sevParts.join('  ') || `${c.dim}no findings yet${c.reset}`);
+  } else {
+    profileLines.push(`${c.dim}Not logged in${c.reset}`);
+    profileLines.push(`${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to create account${c.reset}`);
+  }
+
+  // Registry box
+  const regLines = [];
+  if (stats) {
+    regLines.push(`Packages Audited    ${c.bold}${fmtNum(stats.skills_audited)}${c.reset}`);
+    regLines.push(`Total Findings      ${c.bold}${fmtNum(stats.total_findings)}${c.reset}`);
+    regLines.push(`Total Reports       ${c.bold}${fmtNum(stats.total_reports)}${c.reset}`);
+    regLines.push(`Contributors        ${c.bold}${fmtNum(stats.reporters)}${c.reset}`);
+    regLines.push(`Avg Trust Score     ${c.bold}${stats.avg_trust_score || 0}${c.reset}`);
+    regLines.push('');
+    const parts = [];
+    if (stats.safe_packages) parts.push(`${c.green}●${fmtNum(stats.safe_packages)} safe${c.reset}`);
+    if (stats.caution_packages) parts.push(`${c.yellow}●${fmtNum(stats.caution_packages)} caution${c.reset}`);
+    if (stats.unsafe_packages) parts.push(`${c.red}●${fmtNum(stats.unsafe_packages)} unsafe${c.reset}`);
+    regLines.push(parts.join('  ') || `${c.dim}no packages yet${c.reset}`);
+  } else {
+    regLines.push(`${c.dim}Could not load registry stats${c.reset}`);
+  }
+
+  const boxW = halfW + 4;
+  const profileBox = drawBox('Your Profile', profileLines, boxW);
+  const registryBox = drawBox('Registry', regLines, boxW);
+
+  // Side by side if wide enough, stacked otherwise
+  if (width >= boxW * 2 + 4) {
+    const maxLen = Math.max(profileBox.length, registryBox.length);
+    while (profileBox.length < maxLen) profileBox.push(`  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
+    while (registryBox.length < maxLen) registryBox.push(`  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
+    for (let i = 0; i < maxLen; i++) {
+      lines.push(profileBox[i] + '  ' + registryBox[i].trimStart());
+    }
+  } else {
+    lines.push(...profileBox, '', ...registryBox);
+  }
+
+  return lines;
+}
+
+function renderLeaderboardTab(data, width, opts = {}) {
+  const { leaderboard, creds } = data;
+  const lines = [];
+  const maxNameW = 20;
+  const barW = Math.min(Math.max(10, width - 70), 30);
+
+  if (!leaderboard || !Array.isArray(leaderboard) || leaderboard.length === 0) {
+    lines.push(`  ${c.dim}No leaderboard data available${c.reset}`);
+    return lines;
+  }
+
+  const maxPts = leaderboard[0]?.total_points || 1;
+  const medals = [`${c.yellow}★${c.reset}`, `${c.cyan}★${c.reset}`, `${c.magenta}★${c.reset}`];
+
+  for (let i = 0; i < leaderboard.length; i++) {
+    const entry = leaderboard[i];
+    const name = (entry.agent_name || '').slice(0, maxNameW);
+    const isMe = creds && entry.agent_name === creds.agent_name;
+    const prefix = i < 3 ? ` ${medals[i]} ` : `  ${c.dim}#${String(i + 1).padStart(2)}${c.reset} `;
+    const nameStr = isMe ? `${c.green}${c.bold}${name}${c.reset}` : name;
+    const bar = renderBar(entry.total_points || 0, maxPts, barW);
+    const pts = padLeft(`${fmtNum(entry.total_points || 0)} pts`, 12);
+    const audits = padLeft(`${fmtNum(entry.total_reports || 0)} audits`, 12);
+    const extra = entry.monthly_reports != null ? padLeft(`${fmtNum(entry.monthly_reports)} this mo`, 12) : '';
+    lines.push(`${prefix}${padRight(nameStr, maxNameW)}  ${bar}  ${pts}  ${audits}${extra}`);
+
+    // Separator after top 3
+    if (i === 2 && leaderboard.length > 3) {
+      lines.push(`  ${c.dim}${'─'.repeat(Math.min(width - 4, 76))}${c.reset}`);
+    }
+  }
+
+  // Highlight current user if not in top list
+  if (creds && !leaderboard.find(e => e.agent_name === creds.agent_name)) {
+    lines.push('');
+    lines.push(`  ${c.dim}← you are not on this leaderboard yet${c.reset}`);
+  }
+
+  return lines;
+}
+
+function renderBenchmarkTab(data, width) {
+  const { benchmark } = data;
+  const lines = [];
+
+  if (!benchmark || !benchmark.models || benchmark.models.length === 0) {
+    lines.push(`  ${c.dim}No benchmark data available${c.reset}`);
+    return lines;
+  }
+
+  const overview = benchmark.overview || {};
+  lines.push(`  ${c.bold}${fmtNum(benchmark.models.length)}${c.reset} models ${c.dim}│${c.reset} ${c.bold}${fmtNum(overview.total_reports || 0)}${c.reset} audits ${c.dim}│${c.reset} ${c.bold}${fmtNum(overview.total_findings || 0)}${c.reset} findings`);
+  lines.push('');
+
+  // Header
+  const nameW = 28;
+  const hdr = `  ${padRight(`${c.bold}Model${c.reset}`, nameW + 9)}  ${padRight('Audits', 7)} ${padRight('Risk', 5)} ${padRight('Detection', 16)}  Severity`;
+  lines.push(hdr);
+  lines.push(`  ${c.dim}${'─'.repeat(Math.min(width - 4, 86))}${c.reset}`);
+
+  for (const m of benchmark.models) {
+    const name = (m.audit_model || 'unknown').slice(0, nameW - 2);
+    const audits = padLeft(fmtNum(m.total_audits), 5);
+    const riskVal = parseFloat(m.avg_risk_score) || 0;
+    const riskColor = riskVal <= 20 ? c.green : riskVal <= 40 ? c.yellow : c.red;
+    const risk = `${riskColor}${padLeft(String(Math.round(riskVal)), 3)}${c.reset}`;
+    const detection = renderGauge(m.detection_rate || 0, 100, 10);
+    // Severity as compact text instead of dots
+    const sev = m.severity_breakdown || {};
+    const sevParts = [];
+    if (sev.critical) sevParts.push(`${c.red}${sev.critical}C${c.reset}`);
+    if (sev.high) sevParts.push(`${c.red}${sev.high}H${c.reset}`);
+    if (sev.medium) sevParts.push(`${c.yellow}${sev.medium}M${c.reset}`);
+    if (sev.low) sevParts.push(`${c.blue}${sev.low}L${c.reset}`);
+    const sevStr = sevParts.length > 0 ? sevParts.join(' ') : `${c.dim}—${c.reset}`;
+    lines.push(`  ${padRight(name, nameW)} ${audits}  ${risk}  ${detection}  ${sevStr}`);
+  }
+
+  // Vulnerability landscape
+  const cats = benchmark.global_categories;
+  if (cats && cats.length > 0) {
+    lines.push('');
+    const catTotal = cats.reduce((sum, cat) => sum + (cat.count || 0), 0) || 1;
+    const catW = Math.min(width - 8, 56);
+    const catLines = [];
+    for (const cat of cats.slice(0, 6)) {
+      const pct = Math.round((cat.count / catTotal) * 100);
+      const barFill = Math.round((cat.count / catTotal) * (catW - 30));
+      catLines.push(`${padRight(cat.category || 'Other', 22)} ${c.cyan}${'█'.repeat(Math.max(1, barFill))}${c.dim}${'░'.repeat(Math.max(0, catW - 30 - barFill))}${c.reset}  ${padLeft(fmtPct(pct), 4)}`);
+    }
+    lines.push(...drawBox('Vulnerability Landscape', catLines, catW + 4));
+  }
+
+  // Cross-model findings
+  const cross = benchmark.cross_model_findings;
+  if (cross && cross.length > 0) {
+    lines.push('');
+    lines.push(`  ${c.bold}Cross-Model Findings${c.reset} ${c.dim}(confirmed by multiple models)${c.reset}`);
+    for (const cf of cross.slice(0, 5)) {
+      const models = (cf.models || []).slice(0, 3).join(', ');
+      lines.push(`  ${c.dim}•${c.reset} ${cf.title || cf.pattern_id}  ${c.dim}[${cf.model_count} models: ${models}]${c.reset}`);
+    }
+  }
+
+  return lines;
+}
+
+function timeAgo(dateStr) {
+  if (!dateStr) return '';
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+function renderActivityTab(data, width) {
+  const { agent, creds } = data;
+  const lines = [];
+
+  if (!creds || !agent) {
+    lines.push(`  ${c.dim}Not logged in${c.reset}`);
+    lines.push(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to see your activity${c.reset}`);
+    return lines;
+  }
+
+  // Recent Audits
+  const reports = agent.recent_reports || [];
+  const auditLines = [];
+  if (reports.length > 0) {
+    for (const r of reports.slice(0, 10)) {
+      const time = padRight(timeAgo(r.created_at), 8);
+      const name = padRight((r.skill_slug || r.package_name || '').slice(0, 20), 20);
+      const score = r.risk_score ?? r.latest_risk_score ?? 0;
+      let status;
+      if (score === 0) status = `${c.green}safe${c.reset}   `;
+      else if (score <= 30) status = `${c.yellow}caution${c.reset}`;
+      else status = `${c.red}unsafe${c.reset} `;
+      const findCount = r.finding_count != null ? `${r.finding_count} findings` : '';
+      const model = r.audit_model ? `${c.dim}${(r.audit_model || '').slice(0, 14)}${c.reset}` : '';
+      auditLines.push(`${c.dim}${time}${c.reset}  ${name}  ${status}  ${padRight(findCount, 12)} ${model}`);
+    }
+  } else {
+    auditLines.push(`${c.dim}No audits yet — run ${c.cyan}agentaudit audit <url>${c.dim} to get started${c.reset}`);
+  }
+  lines.push(...drawBox('Recent Audits', auditLines, Math.min(width - 4, 72)));
+  lines.push('');
+
+  // Recent Findings
+  const findings = agent.recent_findings || [];
+  const findingLines = [];
+  if (findings.length > 0) {
+    for (const f of findings.slice(0, 10)) {
+      const asfId = padRight(f.asf_id || f.id || '', 16);
+      const sev = severityIcon(f.severity);
+      const sevLabel = padRight(f.severity || '', 9);
+      const title = (f.title || f.pattern_id || '').slice(0, 40);
+      findingLines.push(`${asfId} ${sev} ${sevLabel} ${title}`);
+    }
+  } else {
+    findingLines.push(`${c.dim}No findings yet${c.reset}`);
+  }
+  lines.push(...drawBox('Recent Findings', findingLines, Math.min(width - 4, 72)));
+
+  return lines;
+}
+
+async function activityCommand(args) {
+  const creds = loadCredentials();
+
+  if (!creds?.agent_name || creds.agent_name === 'env') {
+    if (jsonMode) {
+      console.log(JSON.stringify({ error: 'not_logged_in' }));
+    } else {
+      banner();
+      console.log(`  ${c.yellow}Not logged in${c.reset}`);
+      console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to create an account${c.reset}`);
+    }
+    return;
+  }
+
+  if (!quietMode && !jsonMode) {
+    banner();
+    process.stdout.write(`  ${c.dim}Loading activity...${c.reset}`);
+  }
+
+  let agentData;
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/agents/${encodeURIComponent(creds.agent_name)}`, {
+      headers: { 'Authorization': `Bearer ${creds.api_key}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    agentData = await res.json();
+  } catch (err) {
+    if (!jsonMode) {
+      process.stdout.write('\r\x1b[2K');
+      console.log(`  ${c.red}Failed to load activity: ${err.message}${c.reset}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(agentData, null, 2));
+    return;
+  }
+
+  process.stdout.write('\r\x1b[2K');
+
+  // Update profile cache
+  try {
+    const lbRes = await fetch(`${REGISTRY_URL}/api/leaderboard?limit=100`, { signal: AbortSignal.timeout(10_000) }).then(r => r.ok ? r.json() : null);
+    let rank = null;
+    if (Array.isArray(lbRes)) {
+      const idx = lbRes.findIndex(e => e.agent_name === creds.agent_name);
+      if (idx >= 0) rank = idx + 1;
+    }
+    saveProfileCache({
+      agent_name: creds.agent_name,
+      rank,
+      total_points: agentData.total_points || 0,
+      total_reports: agentData.total_reports || 0,
+    });
+  } catch {}
+
+  const width = process.stdout.columns || 80;
+  const activityLines = renderActivityTab({ agent: agentData, creds }, width);
+  console.log(`  ${c.bold}Activity${c.reset}  ${c.dim}${creds.agent_name}${c.reset}`);
+  console.log();
+  for (const line of activityLines) console.log(line);
+  console.log();
+}
+
+function renderSearchResults(data, width) {
+  const lines = [];
+  const boxW = Math.min(width - 4, 72);
+
+  // Lookup API returns { reports: [], findings: [], total_matches }
+  const lookupData = Array.isArray(data) ? data[0] : data;
+  const reports = lookupData?.reports || [];
+  const findings = lookupData?.findings || [];
+  const total = lookupData?.total_matches || (reports.length + findings.length);
+
+  if (total === 0) return lines;
+
+  // Packages (from reports)
+  if (reports.length > 0) {
+    const pkgLines = [];
+    for (const r of reports.slice(0, 10)) {
+      const name = padRight((r.skill_slug || '').slice(0, 22), 22);
+      const riskScore = r.risk_score ?? 0;
+      let badge;
+      if (riskScore === 0) badge = `${c.green}SAFE${c.reset}   `;
+      else if (riskScore <= 30) badge = `${c.yellow}CAUTION${c.reset}`;
+      else badge = `${c.red}UNSAFE${c.reset} `;
+      const time = padRight(timeAgo(r.created_at), 8);
+      pkgLines.push(`${name}  ${badge}  ${c.dim}${time}${c.reset}`);
+    }
+    lines.push(...drawBox(`Packages (${reports.length})`, pkgLines, boxW));
+    lines.push('');
+  }
+
+  // Findings
+  if (findings.length > 0) {
+    const findLines = [];
+    for (const f of findings.slice(0, 10)) {
+      const asfId = padRight(f.asf_id || '', 16);
+      const sev = severityIcon(f.severity);
+      const sevLabel = padRight(f.severity || '', 9);
+      const title = (f.title || '').slice(0, 36);
+      findLines.push(`${asfId} ${sev} ${sevLabel} ${title}`);
+    }
+    lines.push(...drawBox(`Findings (${findings.length})`, findLines, boxW));
+  }
+
+  return lines;
+}
+
+function renderSearchTab(searchState, width) {
+  const { query, results, loading, error } = searchState;
+  const lines = [];
+
+  // Search input
+  lines.push(`  ${c.bold}Search:${c.reset} ${query || ''}${c.dim}\u2588${c.reset}`);
+  lines.push('');
+
+  if (loading) {
+    lines.push(`  ${c.dim}Searching...${c.reset}`);
+    return lines;
+  }
+
+  if (error) {
+    lines.push(`  ${c.red}${error}${c.reset}`);
+    return lines;
+  }
+
+  if (results) {
+    const resultLines = renderSearchResults(results, width);
+    if (resultLines.length > 0) {
+      lines.push(...resultLines);
+    } else {
+      lines.push(`  ${c.dim}No results found for "${query}"${c.reset}`);
+    }
+  } else if (!query) {
+    lines.push(`  ${c.dim}Type to search packages in the registry${c.reset}`);
+  }
+
+  lines.push('');
+  lines.push(`  ${c.dim}Type to search  \u2502  Enter=search  \u2502  Esc=clear  \u2502  Tab=switch tab${c.reset}`);
+
+  return lines;
+}
+
+async function searchCommand(args) {
+  const query = args.filter(a => !a.startsWith('--')).join(' ').trim();
+
+  if (!query) {
+    if (jsonMode) {
+      console.log(JSON.stringify({ error: 'query_required' }));
+    } else {
+      banner();
+      console.log(`  ${c.red}Error: search query required${c.reset}`);
+      console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit search <query>${c.dim} \u2014 e.g. agentaudit search fastmcp${c.reset}`);
+    }
+    process.exitCode = 2;
+    return;
+  }
+
+  if (!quietMode && !jsonMode) {
+    banner();
+    process.stdout.write(`  ${c.dim}Searching "${query}"...${c.reset}`);
+  }
+
+  let data;
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/lookup?hash=${encodeURIComponent(query)}`, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    if (!jsonMode) {
+      process.stdout.write('\r\x1b[2K');
+      console.log(`  ${c.red}Search failed: ${err.message}${c.reset}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  process.stdout.write('\r\x1b[2K');
+  console.log(`  ${c.bold}Search${c.reset}  ${c.dim}"${query}"${c.reset}`);
+  console.log();
+
+  const width = process.stdout.columns || 80;
+  const resultLines = renderSearchResults(data, width);
+  if (resultLines.length === 0) {
+    console.log(`  ${c.dim}No results found${c.reset}`);
+    console.log(`  ${c.dim}Tip: try ${c.cyan}agentaudit scan <repo-url>${c.dim} to audit a new package${c.reset}`);
+    console.log();
+    return;
+  }
+
+  for (const line of resultLines) console.log(line);
+  console.log();
+}
+
+async function leaderboardCommand(args) {
+  const tabArg = args.find((a, i) => args[i - 1] === '--tab') || 'overall';
+  const showAll = args.includes('--all');
+  const limit = showAll ? 200 : 20;
+
+  if (!quietMode && !jsonMode) {
+    banner();
+    process.stdout.write(`  ${c.dim}Loading leaderboard...${c.reset}`);
+  }
+
+  let data;
+  try {
+    const url = `${REGISTRY_URL}/api/leaderboard?tab=${encodeURIComponent(tabArg)}&limit=${limit}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    if (!jsonMode) {
+      process.stdout.write('\r\x1b[2K');
+      console.log(`  ${c.red}Failed to load leaderboard: ${err.message}${c.reset}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  process.stdout.write('\r\x1b[2K');
+  const creds = loadCredentials();
+  console.log(`  ${c.bold}Leaderboard${c.reset}  ${c.dim}${tabArg}${c.reset}`);
+  console.log();
+
+  if (!Array.isArray(data) || data.length === 0) {
+    console.log(`  ${c.dim}No data available${c.reset}`);
+    return;
+  }
+
+  const maxPts = data[0]?.total_points || 1;
+  const medals = [`${c.yellow}★${c.reset}`, `${c.cyan}★${c.reset}`, `${c.magenta}★${c.reset}`];
+  const barW = 24;
+
+  for (let i = 0; i < data.length; i++) {
+    const entry = data[i];
+    const name = (entry.agent_name || '').slice(0, 20);
+    const isMe = creds && entry.agent_name === creds.agent_name;
+    const prefix = i < 3 ? ` ${medals[i]} ` : `  #${String(i + 1).padStart(2)}  `;
+    const nameStr = isMe ? `${c.green}${c.bold}${name}${c.reset}` : name;
+    const bar = renderBar(entry.total_points || 0, maxPts, barW);
+    const pts = `${fmtNum(entry.total_points || 0)} pts`;
+    const audits = `${fmtNum(entry.total_reports || 0)} audits`;
+    console.log(`${prefix}${padRight(nameStr, 22)}  ${bar}  ${padLeft(pts, 12)}  ${padLeft(audits, 10)}`);
+    if (i === 2 && data.length > 3) {
+      console.log(`  ${c.dim}${'─'.repeat(74)}${c.reset}`);
+    }
+  }
+  console.log();
+}
+
+async function benchmarkCommand(args) {
+  if (!quietMode && !jsonMode) {
+    banner();
+    process.stdout.write(`  ${c.dim}Loading benchmark data...${c.reset}`);
+  }
+
+  let data;
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/benchmark`, { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    if (!jsonMode) {
+      process.stdout.write('\r\x1b[2K');
+      console.log(`  ${c.red}Failed to load benchmark: ${err.message}${c.reset}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (jsonMode) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  process.stdout.write('\r\x1b[2K');
+  const width = process.stdout.columns || 80;
+  const benchLines = renderBenchmarkTab({ benchmark: data }, width);
+  console.log(`  ${c.bold}Model Benchmark${c.reset} ${c.dim}— LLM Audit Performance${c.reset}`);
+  console.log();
+  for (const line of benchLines) console.log(line);
+  console.log();
+}
+
+async function dashboardCommand() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`${c.red}Error: dashboard requires an interactive terminal${c.reset}`);
+    console.log(`${c.dim}Tip: use ${c.cyan}agentaudit leaderboard${c.dim} or ${c.cyan}agentaudit benchmark${c.dim} for non-interactive output${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const tabs = [
+    { key: '1', label: 'Overview' },
+    { key: '2', label: 'Leaderboard' },
+    { key: '3', label: 'Benchmark' },
+    { key: '4', label: 'Activity' },
+    { key: '5', label: 'Search' },
+  ];
+  let activeTab = 0;
+  let scrollOffset = 0;
+  let running = true;
+
+  // Search tab state
+  let searchQuery = '';
+  let searchResults = null;
+  let searchLoading = false;
+  let searchError = null;
+
+  // Enter alt screen
+  process.stdout.write(term.altScreenOn + term.hideCursor);
+
+  // Loading screen
+  process.stdout.write(term.clearScreen);
+  const bannerLines = dashboardBanner();
+  for (const line of bannerLines) process.stdout.write(line + '\n');
+  process.stdout.write(`\n  ${c.dim}Loading data...${c.reset}\n`);
+
+  // Fetch data
+  const data = await fetchDashboardData();
+
+  async function doSearch() {
+    if (!searchQuery.trim()) return;
+    searchLoading = true;
+    searchError = null;
+    render();
+    try {
+      const res = await fetch(`${REGISTRY_URL}/api/lookup?hash=${encodeURIComponent(searchQuery.trim())}`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      searchResults = await res.json();
+    } catch (err) {
+      searchError = `Search failed: ${err.message}`;
+      searchResults = null;
+    }
+    searchLoading = false;
+    if (running) render();
+  }
+
+  function render() {
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+    let output = term.clearScreen;
+
+    // Banner
+    const bLines = dashboardBanner();
+    for (const line of bLines) output += line + '\n';
+    output += '\n';
+
+    // Tab bar
+    let tabBar = '  ';
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i];
+      if (i === activeTab) {
+        tabBar += `${c.bold}${c.cyan}${term.underline} [${tab.key}] ${tab.label} ${term.noUnderline}${c.reset}`;
+      } else {
+        tabBar += `${c.dim} [${tab.key}] ${tab.label} ${c.reset}`;
+      }
+      if (i < tabs.length - 1) tabBar += `${c.dim}\u2500${c.reset}`;
+    }
+    output += tabBar + '\n\n';
+
+    // Tab content
+    let contentLines = [];
+    switch (activeTab) {
+      case 0:
+        contentLines = renderOverviewTab(data, cols);
+        break;
+      case 1:
+        contentLines = renderLeaderboardTab(data, cols);
+        break;
+      case 2:
+        contentLines = renderBenchmarkTab(data, cols);
+        break;
+      case 3:
+        contentLines = renderActivityTab(data, cols);
+        break;
+      case 4:
+        contentLines = renderSearchTab({ query: searchQuery, results: searchResults, loading: searchLoading, error: searchError }, cols);
+        break;
+    }
+
+    // Apply scroll
+    const availableRows = rows - 10; // header + tab bar + footer
+    const maxScroll = Math.max(0, contentLines.length - availableRows);
+    scrollOffset = Math.min(scrollOffset, maxScroll);
+    scrollOffset = Math.max(0, scrollOffset);
+
+    const visible = contentLines.slice(scrollOffset, scrollOffset + availableRows);
+    for (const line of visible) output += line + '\n';
+
+    // Footer
+    output += '\n';
+    const scrollInfo = contentLines.length > availableRows ? `  ${c.dim}[${scrollOffset + 1}-${Math.min(scrollOffset + availableRows, contentLines.length)}/${contentLines.length}]${c.reset}` : '';
+    const isSearchTab = activeTab === 4;
+    const footerHint = isSearchTab
+      ? `${c.dim}\u2190\u2192 tab  Enter=search  Esc=clear  q quit${c.reset}`
+      : `${c.dim}\u2190\u2192 tab  \u2191\u2193 scroll  1-5 jump  q quit${c.reset}`;
+    output += `  ${footerHint}${scrollInfo}\n`;
+
+    process.stdout.write(output);
+  }
+
+  function cleanup() {
+    if (!running) return;
+    running = false;
+    process.stdout.write(term.showCursor + term.altScreenOff);
+    try { process.stdin.setRawMode(false); } catch {}
+    process.stdin.pause();
+    process.stdin.removeListener('data', onKeypress);
+    process.stdout.removeListener('resize', render);
+  }
+
+  function onKeypress(key) {
+    if (!running) return;
+    const isSearchTab = activeTab === 4;
+
+    // Ctrl+C always quits
+    if (key === '\x03') {
+      cleanup();
+      return;
+    }
+
+    // Search tab: route printable keys to search input
+    if (isSearchTab) {
+      // Escape: clear search
+      if (key === '\x1b' && key.length === 1) {
+        searchQuery = '';
+        searchResults = null;
+        searchError = null;
+        scrollOffset = 0;
+        render();
+        return;
+      }
+
+      // Enter: trigger search
+      if (key === '\r' || key === '\n') {
+        doSearch();
+        return;
+      }
+
+      // Backspace / Delete
+      if (key === '\x7f' || key === '\b') {
+        if (searchQuery.length > 0) {
+          searchQuery = searchQuery.slice(0, -1);
+          render();
+        }
+        return;
+      }
+
+      // Tab: switch to next tab
+      if (key === '\t') {
+        activeTab = (activeTab + 1) % tabs.length;
+        scrollOffset = 0;
+        render();
+        return;
+      }
+
+      // Arrow keys still navigate
+      if (key === '\x1b[C') { activeTab = (activeTab + 1) % tabs.length; scrollOffset = 0; render(); return; }
+      if (key === '\x1b[D') { activeTab = (activeTab - 1 + tabs.length) % tabs.length; scrollOffset = 0; render(); return; }
+      if (key === '\x1b[A') { scrollOffset = Math.max(0, scrollOffset - 1); render(); return; }
+      if (key === '\x1b[B') { scrollOffset++; render(); return; }
+
+      // q quits only if search buffer is empty
+      if (key === 'q' && searchQuery.length === 0) {
+        cleanup();
+        return;
+      }
+
+      // Printable ASCII → append to search query
+      if (key.length === 1 && key.charCodeAt(0) >= 32 && key.charCodeAt(0) <= 126) {
+        searchQuery += key;
+        render();
+        return;
+      }
+      return;
+    }
+
+    // Non-search tabs: normal keypress handling
+    // q = quit
+    if (key === 'q') {
+      cleanup();
+      return;
+    }
+
+    // Tab navigation
+    if (key === '\x1b[C' || key === '\t') {
+      activeTab = (activeTab + 1) % tabs.length;
+      scrollOffset = 0;
+      render();
+      return;
+    }
+    if (key === '\x1b[D') {
+      activeTab = (activeTab - 1 + tabs.length) % tabs.length;
+      scrollOffset = 0;
+      render();
+      return;
+    }
+
+    // Number keys 1-5
+    if (key >= '1' && key <= '5') {
+      const idx = parseInt(key, 10) - 1;
+      if (idx < tabs.length) { activeTab = idx; scrollOffset = 0; render(); }
+      return;
+    }
+
+    // Scroll
+    if (key === '\x1b[A' || key === 'k') { scrollOffset = Math.max(0, scrollOffset - 1); render(); return; }
+    if (key === '\x1b[B' || key === 'j') { scrollOffset++; render(); return; }
+    if (key === '\x1b[5~') { scrollOffset = Math.max(0, scrollOffset - 10); render(); return; }
+    if (key === '\x1b[6~') { scrollOffset += 10; render(); return; }
+  }
+
+  // Setup input
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', onKeypress);
+  process.stdout.on('resize', render);
+
+  // Graceful cleanup
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => { cleanup(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+
+  // Initial render
+  render();
+
+  // Keep alive until user quits
+  await new Promise(resolve => {
+    const check = setInterval(() => {
+      if (!running) { clearInterval(check); resolve(); }
+    }, 100);
+  });
+}
+
 // ── Main ────────────────────────────────────────────────
 
 async function main() {
@@ -1871,60 +3281,314 @@ async function main() {
   // --no-color already handled at top level for `c` object
   
   // Strip global flags from args (including --model <value>)
-  const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color']);
+  const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color', '--no-upload']);
   let args = rawArgs.filter(a => !globalFlags.has(a));
   // Remove --model <value> pair
   const modelIdx = args.indexOf('--model');
   if (modelIdx !== -1) args.splice(modelIdx, 2);
   
+  // Detect per-command --help BEFORE stripping (e.g. `agentaudit model --help`)
+  const wantsHelp = args.includes('--help') || args.includes('-h');
+  // Strip --help/-h from args for routing
+  args = args.filter(a => a !== '--help' && a !== '-h');
+
   if (args[0] === '-v' || args[0] === '--version') {
     console.log(`agentaudit ${getVersion()}`);
     process.exitCode = 0; return;
   }
-  
-  if (args[0] === '--help' || args[0] === '-h') {
+
+  // Subcommand help definitions
+  const subcommandHelp = {
+    discover: [
+      `${c.bold}agentaudit discover${c.reset} [options]`,
+      ``,
+      `Find MCP servers across 15+ AI tools (Claude Desktop, Claude Code, Cursor, VS Code,`,
+      `Windsurf, Cline, Roo Code, Amazon Q, Gemini CLI, Zed, Continue.dev, Goose, Codex CLI).`,
+      `Checks global + project-level configs on macOS, Windows, and Linux.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --quick, -s    Auto-scan all discovered servers (regex-based)`,
+      `  --deep, -a     Interactively select servers for deep LLM audit`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit discover`,
+      `  agentaudit discover --quick`,
+      `  agentaudit discover --deep`,
+    ],
+    scan: [
+      `${c.bold}agentaudit scan${c.reset} <url> [url...] [options]`,
+      ``,
+      `Quick regex-based static security scan (~2s). Checks for 15+ patterns`,
+      `(command injection, eval, hardcoded secrets, path traversal, etc.)`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --deep         Run deep LLM audit instead (same as \`agentaudit audit\`)`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit scan https://github.com/owner/repo`,
+      `  agentaudit scan https://github.com/a/b https://github.com/c/d`,
+      `  agentaudit scan https://github.com/owner/repo --deep`,
+    ],
+    audit: [
+      `${c.bold}agentaudit audit${c.reset} <url> [url...] [options]`,
+      ``,
+      `Deep LLM-powered 3-pass security audit (~30s). Requires an LLM API key.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --model <name>   Override LLM model for this run`,
+      `  --no-upload      Skip uploading report to registry`,
+      `  --export         Export audit payload as markdown (for manual LLM review)`,
+      `  --debug          Show raw LLM response on parse errors`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit audit https://github.com/owner/repo`,
+      `  agentaudit audit https://github.com/owner/repo --no-upload`,
+      `  agentaudit audit https://github.com/owner/repo --model gpt-4o`,
+      `  agentaudit audit https://github.com/owner/repo --export`,
+    ],
+    lookup: [
+      `${c.bold}agentaudit lookup${c.reset} <name> [options]`,
+      ``,
+      `Look up a package in the AgentAudit registry. Shows trust score,`,
+      `findings, confidence level, and audit history.`,
+      ``,
+      `${c.bold}Aliases:${c.reset} lookup, check`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit lookup fastmcp`,
+      `  agentaudit lookup @anthropic/mcp-server-filesystem --json`,
+      `  agentaudit check fastmcp`,
+    ],
+    check: null, // alias → lookup
+    model: [
+      `${c.bold}agentaudit model${c.reset} [name|reset]`,
+      ``,
+      `Configure LLM provider and model. Interactive two-step menu when`,
+      `called without arguments: choose provider, then choose model.`,
+      ``,
+      `${c.bold}Usage:${c.reset}`,
+      `  agentaudit model              Interactive provider + model menu`,
+      `  agentaudit model <name>       Set model directly (keeps current provider)`,
+      `  agentaudit model reset        Reset provider + model to defaults`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit model`,
+      `  agentaudit model gpt-4o`,
+      `  agentaudit model qwen/qwen3-coder`,
+      `  agentaudit model reset`,
+    ],
+    setup: [
+      `${c.bold}agentaudit setup${c.reset}`,
+      ``,
+      `Log in to agentaudit.dev — create an account or enter an existing API key.`,
+      `This enables uploading audit reports to the public registry.`,
+      ``,
+      `${c.bold}Note:${c.reset} This is NOT for LLM/provider configuration. Use ${c.cyan}agentaudit model${c.reset} for that.`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit setup`,
+    ],
+    status: [
+      `${c.bold}agentaudit status${c.reset}`,
+      ``,
+      `Show current configuration: active LLM provider, model, account`,
+      `status, and which API keys are available.`,
+      ``,
+      `${c.bold}Aliases:${c.reset} status, whoami`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit status`,
+      `  agentaudit status --json`,
+    ],
+    dashboard: [
+      `${c.bold}agentaudit dashboard${c.reset}`,
+      ``,
+      `Interactive full-screen dashboard with stats, leaderboard, and benchmark.`,
+      `Uses alternate screen buffer — your scrollback stays intact.`,
+      ``,
+      `${c.bold}Navigation:${c.reset}`,
+      `  \u2190\u2192 / Tab      Switch between tabs`,
+      `  1-5            Jump to tab by number`,
+      `  \u2191\u2193 / j/k       Scroll content`,
+      `  PgUp/PgDn     Scroll fast`,
+      `  q / Ctrl+C    Quit`,
+      ``,
+      `${c.bold}Tabs:${c.reset}`,
+      `  [1] Overview    Your profile + registry stats`,
+      `  [2] Leaderboard Top contributors ranking`,
+      `  [3] Benchmark   LLM model performance comparison`,
+      `  [4] Activity    Your recent audits & findings`,
+      `  [5] Search      Search packages (interactive input)`,
+      ``,
+      `${c.bold}Aliases:${c.reset} dashboard, dash`,
+    ],
+    dash: null, // alias → dashboard
+    leaderboard: [
+      `${c.bold}agentaudit leaderboard${c.reset} [options]`,
+      ``,
+      `Show top contributors ranking. Pipe-friendly output (no alt-screen).`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --tab <name>   Category: overall (default), monthly, reviewers, verifiers, streaks`,
+      `  --all           Show all entries (default: top 20)`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Aliases:${c.reset} leaderboard, lb`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit leaderboard`,
+      `  agentaudit leaderboard --tab monthly`,
+      `  agentaudit leaderboard --all --json`,
+    ],
+    lb: null, // alias → leaderboard
+    benchmark: [
+      `${c.bold}agentaudit benchmark${c.reset} [options]`,
+      ``,
+      `Compare LLM model performance across security audits.`,
+      `Shows detection rates, severity breakdown, and vulnerability landscape.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Aliases:${c.reset} benchmark, bench`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit benchmark`,
+      `  agentaudit benchmark --json`,
+    ],
+    bench: null, // alias → benchmark
+    activity: [
+      `${c.bold}agentaudit activity${c.reset} [options]`,
+      ``,
+      `Show your recent audits and findings from the AgentAudit registry.`,
+      `Requires being logged in (run ${c.cyan}agentaudit setup${c.reset} first).`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Aliases:${c.reset} activity, my`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit activity`,
+      `  agentaudit activity --json`,
+      `  agentaudit my`,
+    ],
+    my: null, // alias → activity
+    search: [
+      `${c.bold}agentaudit search${c.reset} <query> [options]`,
+      ``,
+      `Search for packages in the AgentAudit registry by name, ASF-ID, or hash.`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Aliases:${c.reset} search, find`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit search fastmcp`,
+      `  agentaudit search mcp-server`,
+      `  agentaudit search ASF-2025-0001`,
+      `  agentaudit search fastmcp --json`,
+      `  agentaudit find fastmcp`,
+    ],
+    find: null, // alias → search
+    profile: [
+      `${c.bold}agentaudit profile${c.reset}`,
+      ``,
+      `Show your AgentAudit profile — rank, points, audit stats,`,
+      `and a link to your public profile on agentaudit.dev.`,
+      ``,
+      `Requires being logged in (run ${c.cyan}agentaudit setup${c.reset} first).`,
+      ``,
+      `${c.bold}Options:${c.reset}`,
+      `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit profile`,
+      `  agentaudit profile --json`,
+    ],
+  };
+
+  // Show subcommand help: `agentaudit help <cmd>` or `agentaudit <cmd> --help`
+  function showSubcommandHelp(cmd) {
+    let helpLines = subcommandHelp[cmd];
+    if (helpLines === null) {
+      // alias redirect
+      const aliases = { check: 'lookup', dash: 'dashboard', lb: 'leaderboard', bench: 'benchmark', my: 'activity', find: 'search' };
+      helpLines = subcommandHelp[aliases[cmd] || cmd];
+    }
+    if (!helpLines) {
+      console.log(`  ${c.red}No help available for "${cmd}"${c.reset}`);
+      console.log(`  ${c.dim}Run ${c.cyan}agentaudit help${c.dim} for available commands${c.reset}`);
+      return;
+    }
     banner();
-    console.log(`  ${c.bold}Commands:${c.reset}`);
+    for (const line of helpLines) console.log(`  ${line}`);
     console.log();
-    console.log(`    ${c.cyan}agentaudit${c.reset}                                   Discover MCP servers (same as discover)`);
-    console.log(`    ${c.cyan}agentaudit discover${c.reset}                          Find MCP servers in your AI editors (Cursor, Claude, VS Code, Windsurf)`);
-    console.log(`    ${c.cyan}agentaudit discover --quick${c.reset}                  Discover + auto-scan all servers`);
-    console.log(`    ${c.cyan}agentaudit discover --deep${c.reset}                   Discover + select servers to deep-audit`);
-    console.log(`    ${c.cyan}agentaudit scan${c.reset} <url> [url...]               Quick static scan (regex, local)`);
-    console.log(`    ${c.cyan}agentaudit scan${c.reset} <url> ${c.dim}--deep${c.reset}                Deep audit (same as audit)`);
-    console.log(`    ${c.cyan}agentaudit audit${c.reset} <url> [url...]              Deep LLM-powered security audit`);
-    console.log(`    ${c.cyan}agentaudit lookup${c.reset} <name>                     Look up package in registry`);
-    console.log(`    ${c.cyan}agentaudit model${c.reset} [name|reset]               View or set default LLM model`);
-    console.log(`    ${c.cyan}agentaudit setup${c.reset}                             Register + configure API key`);
+  }
+
+  // Handle: `agentaudit <cmd> --help` (wantsHelp + has a command)
+  if (wantsHelp && args[0] && args[0] !== '--help' && args[0] !== '-h') {
+    const cmd = args[0];
+    if (subcommandHelp[cmd] !== undefined) {
+      showSubcommandHelp(cmd);
+      process.exitCode = 0; return;
+    }
+  }
+
+  // Handle: `agentaudit help [cmd]`
+  if (args[0] === 'help') {
+    const helpCmd = args[1];
+    if (helpCmd && subcommandHelp[helpCmd] !== undefined) {
+      showSubcommandHelp(helpCmd);
+      process.exitCode = 0; return;
+    }
+    // No subcommand or unknown → show main help
+    wantsHelp || (args[0] = '--help'); // fall through to main help
+  }
+
+  if (args[0] === '--help' || args[0] === '-h' || args[0] === 'help' || (wantsHelp && args.length === 0)) {
+    banner();
+    console.log(`  ${c.bold}USAGE${c.reset}`);
+    console.log(`    agentaudit <command> [options]`);
     console.log();
-    console.log(`  ${c.bold}Global flags:${c.reset}`);
-    console.log(`    ${c.dim}--json           Output JSON to stdout (machine-readable)${c.reset}`);
-    console.log(`    ${c.dim}--quiet          Suppress banner and tree visualization${c.reset}`);
-    console.log(`    ${c.dim}--no-color       Disable ANSI colors (also: NO_COLOR env)${c.reset}`);
-    console.log(`    ${c.dim}--model <name>   Override LLM model (e.g. qwen/qwen3.5-coder-32b)${c.reset}`);
+    console.log(`  ${c.bold}SCAN & AUDIT${c.reset}`);
+    console.log(`    ${c.cyan}discover${c.reset}              Find MCP servers in your AI editors`);
+    console.log(`    ${c.cyan}scan${c.reset} <url> [url...]   Quick static scan (regex, ~2s)`);
+    console.log(`    ${c.cyan}audit${c.reset} <url> [url...]  Deep LLM-powered security audit (~30s)`);
+    console.log(`    ${c.cyan}lookup${c.reset} <name>         Look up package in registry`);
     console.log();
-    console.log(`  ${c.bold}Quick Scan${c.reset} vs ${c.bold}Deep Audit${c.reset}:`);
-    console.log(`    ${c.dim}scan  = fast regex-based static analysis (~2s)${c.reset}`);
-    console.log(`    ${c.dim}audit = deep LLM analysis with 3-pass methodology (~30s)${c.reset}`);
+    console.log(`  ${c.bold}COMMUNITY${c.reset}`);
+    console.log(`    ${c.cyan}dashboard${c.reset}             Interactive dashboard (full-screen)`);
+    console.log(`    ${c.cyan}leaderboard${c.reset}           Top contributors ranking`);
+    console.log(`    ${c.cyan}benchmark${c.reset}             LLM model performance comparison`);
+    console.log(`    ${c.cyan}activity${c.reset}              Your recent audits & findings`);
+    console.log(`    ${c.cyan}search${c.reset} <query>        Search packages in registry`);
     console.log();
-    console.log(`  ${c.bold}Exit codes:${c.reset}`);
-    console.log(`    ${c.dim}0 = clean / success    1 = findings detected    2 = error${c.reset}`);
+    console.log(`  ${c.bold}CONFIGURATION${c.reset}`);
+    console.log(`    ${c.cyan}model${c.reset}                 Configure LLM provider + model`);
+    console.log(`    ${c.cyan}setup${c.reset}                 Log in to agentaudit.dev (for report uploads)`);
+    console.log(`    ${c.cyan}status${c.reset}                Show current config + auth status`);
+    console.log(`    ${c.cyan}profile${c.reset}               Your profile — rank, points, audit stats`);
     console.log();
-    console.log(`  ${c.bold}Examples:${c.reset}`);
-    console.log(`    agentaudit`);
+    console.log(`  ${c.bold}FLAGS${c.reset}`);
+    console.log(`    ${c.dim}--json             Machine-readable JSON output${c.reset}`);
+    console.log(`    ${c.dim}--quiet            Suppress banner${c.reset}`);
+    console.log(`    ${c.dim}--no-color         Disable ANSI colors (also: NO_COLOR env)${c.reset}`);
+    console.log(`    ${c.dim}--model <name>     Override LLM model for this run${c.reset}`);
+    console.log(`    ${c.dim}--no-upload        Skip uploading report to registry${c.reset}`);
+    console.log(`    ${c.dim}--export           Export audit payload as markdown${c.reset}`);
+    console.log(`    ${c.dim}--debug            Show raw LLM response on parse errors${c.reset}`);
+    console.log();
+    console.log(`  ${c.bold}EXAMPLES${c.reset}`);
     console.log(`    agentaudit discover --quick`);
     console.log(`    agentaudit scan https://github.com/owner/repo`);
     console.log(`    agentaudit audit https://github.com/owner/repo`);
     console.log(`    agentaudit lookup fastmcp --json`);
     console.log();
-    console.log(`  ${c.bold}For deep audits,${c.reset} set any LLM API key:`);
-    console.log(`    ${c.dim}ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY,${c.reset}`);
-    console.log(`    ${c.dim}MISTRAL_API_KEY, XAI_API_KEY, GROQ_API_KEY, TOGETHER_API_KEY,${c.reset}`);
-    console.log(`    ${c.dim}FIREWORKS_API_KEY, CEREBRAS_API_KEY, ZAI_API_KEY, or OPENROUTER_API_KEY${c.reset}`);
-    console.log();
-    console.log(`  ${c.bold}Or use as MCP server${c.reset} in Cursor/Claude ${c.dim}(no extra API key needed):${c.reset}`);
-    console.log(`    ${c.dim}Add to your MCP config:${c.reset}`);
-    console.log(`    ${c.dim}{ "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } }${c.reset}`);
+    console.log(`  ${c.bold}LEARN MORE${c.reset}`);
+    console.log(`    ${c.dim}agentaudit help <command>${c.reset}     Help for a specific command`);
+    console.log(`    ${c.dim}https://agentaudit.dev${c.reset}        Documentation`);
     console.log();
     process.exitCode = 0; return;
   }
@@ -1932,33 +3596,258 @@ async function main() {
   // Default no-arg → discover
   const command = args.length === 0 ? 'discover' : args[0];
   const targets = args.slice(1);
-  
+
+  // Dashboard/Leaderboard/Benchmark — before banner() since dashboard uses alt-screen
+  if (command === 'dashboard' || command === 'dash') {
+    await dashboardCommand();
+    return;
+  }
+  if (command === 'leaderboard' || command === 'lb') {
+    await leaderboardCommand(targets);
+    return;
+  }
+  if (command === 'benchmark' || command === 'bench') {
+    await benchmarkCommand(targets);
+    return;
+  }
+  if (command === 'activity' || command === 'my') {
+    await activityCommand(targets);
+    return;
+  }
+  if (command === 'search' || command === 'find') {
+    await searchCommand(targets);
+    return;
+  }
+
   banner();
-  
+
   if (command === 'setup') {
     await setupCommand();
     return;
   }
 
+  if (command === 'status' || command === 'whoami') {
+    // ── Status / diagnostic overview ──
+    const config = loadLlmConfig();
+    const creds = loadCredentials();
+    const resolved = resolveProvider();
+
+    console.log(`  ${c.bold}Status${c.reset}`);
+    console.log();
+
+    // Provider + Model
+    const prefProvider = config?.preferred_provider;
+    const prefModel = config?.llm_model;
+    if (prefProvider && resolved) {
+      console.log(`  Provider    ${c.bold}${resolved.name}${c.reset}  ${c.dim}(${resolved.key})${c.reset}  ${c.green}✔${c.reset}`);
+    } else if (resolved) {
+      console.log(`  Provider    ${c.bold}${resolved.name}${c.reset}  ${c.dim}(auto-detected via ${resolved.key})${c.reset}  ${c.green}✔${c.reset}`);
+    } else {
+      console.log(`  Provider    ${c.yellow}none${c.reset}  ${c.dim}— set an API key or run ${c.cyan}agentaudit model${c.dim}${c.reset}`);
+    }
+
+    if (prefModel) {
+      console.log(`  Model       ${c.bold}${prefModel}${c.reset}  ${c.dim}(custom)${c.reset}`);
+    } else if (resolved) {
+      console.log(`  Model       ${c.dim}${resolved.model} (provider default)${c.reset}`);
+    } else {
+      console.log(`  Model       ${c.dim}—${c.reset}`);
+    }
+    console.log();
+
+    // Account / auth
+    if (creds) {
+      console.log(`  Account     ${c.bold}${creds.agent_name}${c.reset}  ${c.green}✔ logged in${c.reset}`);
+      console.log(`  ${c.dim}            Key: ${creds.api_key.slice(0, 12)}...${c.reset}`);
+    } else {
+      console.log(`  Account     ${c.yellow}not configured${c.reset}  ${c.dim}— run ${c.cyan}agentaudit setup${c.dim} to create one${c.reset}`);
+    }
+    console.log();
+
+    // All provider keys
+    const seen = new Set();
+    const keyLines = [];
+    for (const p of LLM_PROVIDERS) {
+      if (seen.has(p.provider)) continue;
+      seen.add(p.provider);
+      const keys = LLM_PROVIDERS.filter(x => x.provider === p.provider);
+      const hasKey = keys.some(x => process.env[x.key]);
+      keyLines.push({ name: p.name, key: p.key, hasKey });
+    }
+    console.log(`  ${c.bold}API Keys${c.reset}`);
+    for (const k of keyLines) {
+      const icon = k.hasKey ? `${c.green}✔${c.reset}` : `${c.dim}✗${c.reset}`;
+      const label = k.hasKey ? k.name : `${c.dim}${k.name}${c.reset}`;
+      console.log(`    ${icon}  ${label}  ${c.dim}${k.key}${c.reset}`);
+    }
+    console.log();
+
+    // Personal stats (from registry, silently skip on error)
+    if (creds?.agent_name && creds.agent_name !== 'env') {
+      try {
+        const [agentRes, lbRes] = await Promise.all([
+          fetch(`${REGISTRY_URL}/api/agents/${encodeURIComponent(creds.agent_name)}`, {
+            headers: { 'Authorization': `Bearer ${creds.api_key}` },
+            signal: AbortSignal.timeout(10_000),
+          }).then(r => r.ok ? r.json() : null),
+          fetch(`${REGISTRY_URL}/api/leaderboard?limit=100`, { signal: AbortSignal.timeout(10_000) }).then(r => r.ok ? r.json() : null),
+        ]);
+        if (agentRes) {
+          let rank = null;
+          if (Array.isArray(lbRes)) {
+            const idx = lbRes.findIndex(e => e.agent_name === creds.agent_name);
+            if (idx >= 0) rank = idx + 1;
+          }
+          // Update profile cache
+          saveProfileCache({
+            agent_name: creds.agent_name,
+            rank,
+            total_points: agentRes.total_points || 0,
+            total_reports: agentRes.total_reports || 0,
+          });
+          console.log(`  ${c.bold}Profile${c.reset}`);
+          console.log(`    Rank        ${c.bold}${rank ? `#${rank} of ${lbRes.length}` : '-'}${c.reset}`);
+          console.log(`    Points      ${c.bold}${fmtNum(agentRes.total_points || 0)}${c.reset}`);
+          console.log(`    Audits      ${c.bold}${fmtNum(agentRes.total_reports || 0)}${c.reset}`);
+          console.log(`    Findings    ${c.bold}${fmtNum(agentRes.total_findings_submitted || 0)}${c.reset} ${c.dim}(${fmtNum(agentRes.total_findings_confirmed || 0)} confirmed)${c.reset}`);
+          console.log();
+        }
+      } catch {}
+    }
+
+    // JSON mode
+    if (jsonMode) {
+      const status = {
+        version: getVersion(),
+        provider: resolved ? { name: resolved.name, provider: resolved.provider, key: resolved.key, model: prefModel || resolved.model } : null,
+        account: creds ? { agent_name: creds.agent_name, has_key: true } : null,
+        api_keys: keyLines.reduce((acc, k) => { acc[k.key] = k.hasKey; return acc; }, {}),
+      };
+      console.log(JSON.stringify(status, null, 2));
+    }
+    return;
+  }
+
+  if (command === 'profile') {
+    const creds = loadCredentials();
+    if (!creds) {
+      console.log(`  ${c.yellow}Not logged in.${c.reset}`);
+      console.log(`  ${c.dim}Run ${c.cyan}agentaudit setup${c.dim} to link your API key.${c.reset}`);
+      console.log();
+      return;
+    }
+
+    const agentName = creds.agent_name || 'unknown';
+    console.log(`  ${c.bold}Profile${c.reset}  ${c.cyan}${agentName}${c.reset}`);
+    console.log();
+
+    try {
+      process.stdout.write(`  ${c.dim}Fetching profile data...${c.reset}`);
+      const [agentRes, lbRes] = await Promise.all([
+        fetch(`${REGISTRY_URL}/api/agents/${encodeURIComponent(agentName)}`, {
+          headers: { 'Authorization': `Bearer ${creds.api_key}` },
+          signal: AbortSignal.timeout(10_000),
+        }).then(r => r.ok ? r.json() : null),
+        fetch(`${REGISTRY_URL}/api/leaderboard?limit=100`, {
+          signal: AbortSignal.timeout(10_000),
+        }).then(r => r.ok ? r.json() : null),
+      ]);
+      process.stdout.write('\r\x1b[K');
+
+      if (!agentRes) {
+        console.log(`  ${c.yellow}Could not fetch profile data.${c.reset}`);
+        console.log(`  ${c.dim}Your account may not have submitted any audits yet.${c.reset}`);
+        console.log();
+        console.log(`  ${c.dim}Web profile: ${c.cyan}${REGISTRY_URL}/profile${c.reset}`);
+        console.log();
+        return;
+      }
+
+      let rank = null;
+      if (Array.isArray(lbRes)) {
+        const idx = lbRes.findIndex(e => e.agent_name === agentName);
+        if (idx >= 0) rank = idx + 1;
+      }
+
+      // Update cache
+      saveProfileCache({
+        agent_name: agentName,
+        rank,
+        total_points: agentRes.total_points || 0,
+        total_reports: agentRes.total_reports || 0,
+      });
+
+      if (jsonMode) {
+        console.log(JSON.stringify({
+          agent_name: agentName,
+          rank: rank ? { position: rank, total: lbRes?.length || 0 } : null,
+          total_points: agentRes.total_points || 0,
+          total_reports: agentRes.total_reports || 0,
+          total_findings_submitted: agentRes.total_findings_submitted || 0,
+          total_findings_confirmed: agentRes.total_findings_confirmed || 0,
+          profile_url: `${REGISTRY_URL}/profile`,
+        }, null, 2));
+        return;
+      }
+
+      const boxW = 44;
+      const rankStr = rank ? `#${rank} of ${lbRes.length}` : '—';
+      const pts = agentRes.total_points || 0;
+      const audits = agentRes.total_reports || 0;
+      const findingsSubmitted = agentRes.total_findings_submitted || 0;
+      const findingsConfirmed = agentRes.total_findings_confirmed || 0;
+      const ptsBar = renderBar(pts, Math.max(pts, 1000), boxW - 16);
+
+      const contentLines = [
+        '',
+        `${c.bold}${c.cyan}${agentName}${c.reset}${' '.repeat(Math.max(1, boxW - 6 - agentName.length - rankStr.length))}${c.bold}${rankStr}${c.reset}`,
+        '',
+        `Points      ${c.bold}${padLeft(fmtNum(pts), 8)}${c.reset}`,
+        `Audits      ${c.bold}${padLeft(fmtNum(audits), 8)}${c.reset}`,
+        `Findings    ${c.bold}${padLeft(fmtNum(findingsSubmitted), 8)}${c.reset}  ${c.dim}(${fmtNum(findingsConfirmed)} confirmed)${c.reset}`,
+        '',
+        ptsBar,
+        '',
+        `${c.dim}${REGISTRY_URL}/profile${c.reset}`,
+        `${c.dim}Key: ${creds.api_key.slice(0, 12)}...${c.reset}`,
+        '',
+      ];
+      const boxLines = drawBox('Profile', contentLines, boxW + 4);
+      for (const line of boxLines) console.log(line);
+      console.log();
+    } catch (err) {
+      process.stdout.write('\r\x1b[K');
+      console.log(`  ${c.yellow}Failed to fetch profile: ${err.message}${c.reset}`);
+      console.log();
+      console.log(`  ${c.dim}Web profile: ${c.cyan}${REGISTRY_URL}/profile${c.reset}`);
+      console.log();
+    }
+    return;
+  }
+
   if (command === 'model') {
     const newModel = targets.filter(t => !t.startsWith('--'))[0];
-    const current = loadLlmConfig()?.llm_model;
+    const config = loadLlmConfig();
+    const current = config?.llm_model;
+    const currentProvider = config?.preferred_provider;
 
-    // Direct set: agentaudit model <name>
+    // Direct set: agentaudit model reset
     if (newModel === 'reset' || newModel === 'clear') {
       for (const f of [USER_CRED_FILE, SKILL_CRED_FILE]) {
         if (fs.existsSync(f)) {
           try {
             const data = JSON.parse(fs.readFileSync(f, 'utf8'));
             delete data.llm_model;
+            delete data.preferred_provider;
             fs.writeFileSync(f, JSON.stringify(data, null, 2), { mode: 0o600 });
           } catch {}
         }
       }
-      console.log(`  ${icons.safe}  Model reset to provider default`);
+      console.log(`  ${icons.safe}  Model + provider reset to defaults`);
       return;
     }
 
+    // Direct set: agentaudit model <name> (sets model only, keeps provider)
     if (newModel) {
       saveLlmConfig(newModel);
       console.log(`  ${icons.safe}  Model set to ${c.bold}${newModel}${c.reset}`);
@@ -1966,82 +3855,136 @@ async function main() {
       return;
     }
 
-    // No argument — interactive menu
-    const activeLlm = LLM_PROVIDERS.find(p => process.env[p.key]);
-    console.log(`  ${c.bold}LLM Model Configuration${c.reset}`);
-    console.log();
-    if (current) {
-      console.log(`  Current: ${c.bold}${c.cyan}${current}${c.reset}`);
-    } else {
-      console.log(`  Current: ${c.dim}(provider default${activeLlm ? `: ${activeLlm.model}` : ''})${c.reset}`);
+    // ── No argument — interactive two-step menu ──
+
+    // Build deduplicated provider list
+    const seen = new Set();
+    const providerList = [];
+    for (const p of LLM_PROVIDERS) {
+      if (seen.has(p.provider)) continue;
+      seen.add(p.provider);
+      // Check if ANY key for this provider is set
+      const keys = LLM_PROVIDERS.filter(x => x.provider === p.provider);
+      const hasKey = keys.some(x => process.env[x.key]);
+      const keyName = p.key;
+      providerList.push({
+        label: p.name,
+        sublabel: hasKey
+          ? `${keyName} ${c.green}✔${c.reset}`
+          : `${keyName} ${c.red}✗${c.reset}  ${c.dim}set: export ${keyName}=...${c.reset}`,
+        value: p.provider,
+        hasKey,
+        keyName,
+      });
     }
-    if (activeLlm) {
-      console.log(`  Provider: ${c.dim}${activeLlm.name} (${activeLlm.key})${c.reset}`);
+
+    // Show status
+    const resolved = resolveProvider();
+    console.log(`  ${c.bold}LLM Configuration${c.reset}`);
+    console.log();
+    if (currentProvider && current) {
+      const provInfo = LLM_PROVIDERS.find(p => p.provider === currentProvider);
+      console.log(`  Active:  ${c.bold}${c.cyan}${provInfo?.name || currentProvider} → ${current}${c.reset}`);
+    } else if (current) {
+      console.log(`  Active:  ${c.bold}${c.cyan}${resolved?.name || 'auto'} → ${current}${c.reset}`);
+    } else if (resolved) {
+      console.log(`  Active:  ${c.dim}${resolved.name} → ${resolved.model} (defaults)${c.reset}`);
+    } else {
+      console.log(`  Active:  ${c.yellow}no provider configured${c.reset}`);
     }
     console.log();
 
-    // Build menu items — deduplicate providers, show popular models
-    const modelChoices = [
-      { label: 'claude-sonnet-4-20250514',                      sublabel: 'Anthropic — fast + smart',         value: 'claude-sonnet-4-20250514' },
-      { label: 'claude-opus-4-20250514',                        sublabel: 'Anthropic — most capable',         value: 'claude-opus-4-20250514' },
-      { label: 'gpt-4o',                                        sublabel: 'OpenAI — fast multimodal',         value: 'gpt-4o' },
-      { label: 'gpt-4.1',                                       sublabel: 'OpenAI — latest',                  value: 'gpt-4.1' },
-      { label: 'gemini-2.5-flash',                               sublabel: 'Google — fast + cheap',            value: 'gemini-2.5-flash' },
-      { label: 'gemini-2.5-pro',                                 sublabel: 'Google — most capable',            value: 'gemini-2.5-pro' },
-      { label: 'deepseek-chat',                                  sublabel: 'DeepSeek — cost-effective',        value: 'deepseek-chat' },
-      { label: 'qwen/qwen3-coder',                              sublabel: 'OpenRouter — code specialist',     value: 'qwen/qwen3-coder' },
-      { label: 'mistral-large-latest',                           sublabel: 'Mistral — EU-hosted',              value: 'mistral-large-latest' },
-      { label: 'grok-3',                                         sublabel: 'xAI — real-time knowledge',        value: 'grok-3' },
-      { label: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',      sublabel: 'Together AI — open source',        value: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
-      { label: 'llama-3.3-70b-versatile',                        sublabel: 'Groq — ultra-fast inference',      value: 'llama-3.3-70b-versatile' },
-      { label: '(reset to provider default)',                     sublabel: '',                                 value: '__reset__' },
-      { label: '(enter custom model name)',                       sublabel: '',                                 value: '__custom__' },
+    // Step A: Provider selection
+    const providerChoices = [
+      ...providerList,
+      { label: '(keep current)', sublabel: '', value: '__keep__', hasKey: true },
     ];
 
-    const selected = await singleSelect(modelChoices, {
-      title: 'Choose default model',
-      hint: '↑↓=move  Enter=select  Esc=cancel',
+    const selectedProvider = await singleSelect(providerChoices, {
+      title: 'Choose provider',
+      hint: '↑↓ move  Enter select  Esc cancel',
     });
 
-    if (selected === null) {
+    if (selectedProvider === null) {
       console.log(`  ${c.dim}Cancelled${c.reset}`);
       return;
     }
 
-    if (selected === '__reset__') {
+    if (selectedProvider === '__keep__') {
+      console.log(`  ${c.dim}Keeping current config${c.reset}`);
+      return;
+    }
+
+    // Check if provider has key set
+    const chosenEntry = providerList.find(p => p.value === selectedProvider);
+    if (chosenEntry && !chosenEntry.hasKey) {
+      console.log();
+      console.log(`  ${c.yellow}${chosenEntry.keyName} is not set.${c.reset}`);
+      console.log(`  ${c.dim}Run: export ${chosenEntry.keyName}=your-key-here${c.reset}`);
+      console.log(`  ${c.dim}Then run "agentaudit model" again.${c.reset}`);
+      return;
+    }
+
+    // Step B: Model selection for chosen provider
+    console.log();
+    const providerModels = PROVIDER_MODELS[selectedProvider] || [];
+    const modelChoices = [
+      ...providerModels,
+      { label: '(enter custom model name)', sublabel: '', value: '__custom__' },
+      { label: '(reset to provider default)', sublabel: '', value: '__reset__' },
+    ];
+
+    const providerName = LLM_PROVIDERS.find(p => p.provider === selectedProvider)?.name || selectedProvider;
+    const selectedModel = await singleSelect(modelChoices, {
+      title: `Choose model for ${providerName}`,
+      hint: '↑↓ move  Enter select  Esc cancel',
+    });
+
+    if (selectedModel === null) {
+      console.log(`  ${c.dim}Cancelled${c.reset}`);
+      return;
+    }
+
+    if (selectedModel === '__reset__') {
+      // Save provider, clear model (use provider default)
+      saveLlmConfig(undefined, selectedProvider);
+      // Also clear llm_model from both files
       for (const f of [USER_CRED_FILE, SKILL_CRED_FILE]) {
         if (fs.existsSync(f)) {
           try {
             const data = JSON.parse(fs.readFileSync(f, 'utf8'));
             delete data.llm_model;
+            data.preferred_provider = selectedProvider;
             fs.writeFileSync(f, JSON.stringify(data, null, 2), { mode: 0o600 });
           } catch {}
         }
       }
+      const defaultModel = LLM_PROVIDERS.find(p => p.provider === selectedProvider)?.model;
       console.log();
-      console.log(`  ${icons.safe}  Model reset to provider default`);
+      console.log(`  ${icons.safe}  Provider: ${c.bold}${providerName}${c.reset}, model: ${c.dim}${defaultModel} (default)${c.reset}`);
       return;
     }
 
-    if (selected === '__custom__') {
+    if (selectedModel === '__custom__') {
       console.log();
       const custom = await askQuestion(`  Model name: `);
       if (!custom) {
         console.log(`  ${c.dim}Cancelled${c.reset}`);
         return;
       }
-      saveLlmConfig(custom);
-      console.log(`  ${icons.safe}  Model set to ${c.bold}${custom}${c.reset}`);
-      if (current) console.log(`  ${c.dim}Was: ${current}${c.reset}`);
+      saveLlmConfig(custom, selectedProvider);
+      console.log(`  ${icons.safe}  Provider: ${c.bold}${providerName}${c.reset}, model: ${c.bold}${custom}${c.reset}`);
+      if (current) console.log(`  ${c.dim}Was: ${currentProvider || 'auto'} → ${current}${c.reset}`);
       return;
     }
 
-    saveLlmConfig(selected);
+    // Normal model selection
+    saveLlmConfig(selectedModel, selectedProvider);
     console.log();
-    console.log(`  ${icons.safe}  Model set to ${c.bold}${selected}${c.reset}`);
-    if (current) console.log(`  ${c.dim}Was: ${current}${c.reset}`);
+    console.log(`  ${icons.safe}  Provider: ${c.bold}${providerName}${c.reset}, model: ${c.bold}${selectedModel}${c.reset}`);
+    if (current) console.log(`  ${c.dim}Was: ${currentProvider || 'auto'} → ${current}${c.reset}`);
     console.log();
-    console.log(`  ${c.dim}Tip: agentaudit model <name>  to set directly, or  agentaudit model reset${c.reset}`);
+    console.log(`  ${c.dim}Tip: agentaudit model <name>  to set model directly, or  agentaudit model reset${c.reset}`);
     return;
   }
   
@@ -2056,6 +3999,7 @@ async function main() {
     const names = targets.filter(t => !t.startsWith('--'));
     if (names.length === 0) {
       console.log(`  ${c.red}Error: package name required${c.reset}`);
+      console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit lookup <name>${c.dim} — e.g. agentaudit lookup fastmcp${c.reset}`);
       process.exitCode = 2;
       return;
     }
@@ -2068,7 +4012,6 @@ async function main() {
       console.log(JSON.stringify(results.length === 1 ? (results[0] || { error: 'not_found' }) : results, null, 2));
     }
     process.exitCode = 0; return;
-    return;
   }
   
   if (command === 'scan') {
@@ -2130,6 +4073,8 @@ async function main() {
     const urls = targets.filter(t => !t.startsWith('--'));
     if (urls.length === 0) {
       console.log(`  ${c.red}Error: at least one repository URL required${c.reset}`);
+      console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit audit <url>${c.dim} — e.g. agentaudit audit https://github.com/owner/repo${c.reset}`);
+      console.log(`  ${c.dim}Tip: use ${c.cyan}agentaudit discover --deep${c.dim} to find & audit locally installed MCP servers${c.reset}`);
       process.exitCode = 2;
       return;
     }
@@ -2144,7 +4089,7 @@ async function main() {
   }
   
   console.log(`  ${c.red}Unknown command: ${command}${c.reset}`);
-  console.log(`  ${c.dim}Run agentaudit --help for usage${c.reset}`);
+  console.log(`  ${c.dim}Run ${c.cyan}agentaudit help${c.dim} for available commands${c.reset}`);
   process.exitCode = 2;
 }
 

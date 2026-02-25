@@ -161,19 +161,66 @@ function slugFromUrl(url) {
 
 function discoverMcpServers() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
+  const platform = process.platform;
+  const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+
   const candidates = [
-    { platform: 'Claude Desktop', path: path.join(home, '.claude', 'mcp.json') },
-    { platform: 'Claude Desktop', path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') },
-    { platform: 'Claude Desktop', path: path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json') },
-    { platform: 'Claude Desktop', path: path.join(home, '.config', 'claude', 'claude_desktop_config.json') },
+    // Claude Desktop
+    ...(platform === 'darwin' ? [{ platform: 'Claude Desktop', path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') }] : []),
+    ...(platform === 'win32'  ? [{ platform: 'Claude Desktop', path: path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json') }] : []),
+    ...(platform === 'linux'  ? [{ platform: 'Claude Desktop', path: path.join(xdgConfig, 'Claude', 'claude_desktop_config.json') }] : []),
+
+    // Claude Code
+    { platform: 'Claude Code', path: path.join(home, '.claude.json') },
+    { platform: 'Claude Code', path: path.join(home, '.claude', 'mcp.json') },
+
+    // Cursor
     { platform: 'Cursor', path: path.join(home, '.cursor', 'mcp.json') },
+
+    // Windsurf
     { platform: 'Windsurf', path: path.join(home, '.codeium', 'windsurf', 'mcp_config.json') },
-    { platform: 'VS Code', path: path.join(home, '.vscode', 'mcp.json') },
+
+    // VS Code (uses 'servers' key)
+    ...(platform === 'darwin' ? [{ platform: 'VS Code', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json'), key: 'servers' }] : []),
+    ...(platform === 'win32'  ? [{ platform: 'VS Code', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'mcp.json'), key: 'servers' }] : []),
+    ...(platform === 'linux'  ? [{ platform: 'VS Code', path: path.join(xdgConfig, 'Code', 'User', 'mcp.json'), key: 'servers' }] : []),
+
+    // Cline extension
+    ...(platform === 'darwin' ? [{ platform: 'Cline', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json') }] : []),
+    ...(platform === 'win32'  ? [{ platform: 'Cline', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json') }] : []),
+    ...(platform === 'linux'  ? [{ platform: 'Cline', path: path.join(xdgConfig, 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json') }] : []),
+
+    // Roo Code extension
+    ...(platform === 'darwin' ? [{ platform: 'Roo Code', path: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json') }] : []),
+    ...(platform === 'win32'  ? [{ platform: 'Roo Code', path: path.join(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json') }] : []),
+    ...(platform === 'linux'  ? [{ platform: 'Roo Code', path: path.join(xdgConfig, 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json') }] : []),
+
+    // Amazon Q Developer
+    { platform: 'Amazon Q', path: path.join(home, '.aws', 'amazonq', 'mcp.json') },
+    { platform: 'Amazon Q (IDE)', path: path.join(home, '.aws', 'amazonq', 'default.json') },
+
+    // Gemini CLI
+    { platform: 'Gemini CLI', path: path.join(home, '.gemini', 'settings.json') },
+
+    // Zed (macOS + Linux)
+    ...(platform === 'darwin' ? [{ platform: 'Zed', path: path.join(home, '.zed', 'settings.json'), key: 'context_servers' }] : []),
+    ...(platform === 'linux'  ? [{ platform: 'Zed', path: path.join(xdgConfig, 'zed', 'settings.json'), key: 'context_servers' }] : []),
+
+    // Continue.dev
+    { platform: 'Continue', path: path.join(home, '.continue', 'config.json') },
+
+    // Visual Studio (Windows only)
+    ...(platform === 'win32' ? [{ platform: 'Visual Studio', path: path.join(home, '.mcp.json') }] : []),
   ];
 
   const results = [];
+  const seenPaths = new Set();
 
   for (const c of candidates) {
+    const resolved = path.resolve(c.path);
+    if (seenPaths.has(resolved)) continue;
+    seenPaths.add(resolved);
+
     if (!fs.existsSync(c.path)) {
       results.push({ platform: c.platform, config_path: c.path, status: 'not found', servers: [] });
       continue;
@@ -182,7 +229,23 @@ function discoverMcpServers() {
     try { content = JSON.parse(fs.readFileSync(c.path, 'utf8')); }
     catch { results.push({ platform: c.platform, config_path: c.path, status: 'parse error', servers: [] }); continue; }
 
-    const serverMap = content.mcpServers || content.servers || {};
+    // Normalize different key structures
+    let serverMap;
+    if (c.key === 'context_servers' && content.context_servers) {
+      serverMap = {};
+      for (const [name, cfg] of Object.entries(content.context_servers)) {
+        if (cfg.command && typeof cfg.command === 'object') {
+          serverMap[name] = { command: cfg.command.path || cfg.command.command, args: cfg.command.args || [], env: cfg.command.env };
+        } else {
+          serverMap[name] = cfg;
+        }
+      }
+    } else if (c.key === 'servers' && content.servers && !content.mcpServers) {
+      serverMap = content.servers;
+    } else {
+      serverMap = content.mcpServers || content.servers || {};
+    }
+
     const servers = [];
     for (const [name, cfg] of Object.entries(serverMap)) {
       const allArgs = [cfg.command, ...(cfg.args || [])].filter(Boolean).join(' ');
@@ -280,7 +343,7 @@ async function checkRegistry(slug) {
 // ── MCP Server ───────────────────────────────────────────
 
 const server = new Server(
-  { name: 'agentaudit', version: '3.11.0' },
+  { name: 'agentaudit', version: '3.12.0' },
   { capabilities: { tools: {} } }
 );
 
