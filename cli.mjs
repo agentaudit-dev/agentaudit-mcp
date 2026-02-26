@@ -2587,10 +2587,43 @@ function loadAuditPrompt() {
   return null;
 }
 
+// Known context window sizes (input tokens) for common models
+const MODEL_CONTEXT_LIMITS = {
+  'claude-sonnet-4': 200000, 'claude-opus-4': 200000, 'claude-haiku-4': 200000,
+  'claude-3.5-sonnet': 200000, 'claude-3-haiku': 200000,
+  'gpt-4o': 128000, 'gpt-4o-mini': 128000, 'gpt-4-turbo': 128000, 'gpt-4': 8192,
+  'gemini-2.5-flash': 1048576, 'gemini-2.5-pro': 1048576, 'gemini-2.0-flash': 1048576,
+  'deepseek-chat': 64000, 'deepseek-reasoner': 64000,
+  'mistral-large': 128000, 'mistral-small': 32000,
+};
+
+function estimateTokens(text) { return Math.ceil(text.length / 3.5); }
+
+function checkContextLimit(model, systemPrompt, userMessage) {
+  const modelKey = Object.keys(MODEL_CONTEXT_LIMITS).find(k => model.toLowerCase().includes(k.toLowerCase()));
+  if (!modelKey) return null; // unknown model, skip check
+  const limit = MODEL_CONTEXT_LIMITS[modelKey];
+  const estimated = estimateTokens(systemPrompt) + estimateTokens(userMessage);
+  if (estimated > limit * 0.9) {
+    return { estimated, limit, pct: Math.round(estimated / limit * 100) };
+  }
+  return null;
+}
+
 async function callLlm(llmConfig, systemPrompt, userMessage) {
   const apiKey = process.env[llmConfig.key];
   if (!apiKey) return { error: `Missing API key: ${llmConfig.key}` };
   const start = Date.now();
+
+  // Context window warning
+  const ctxCheck = checkContextLimit(llmConfig.model, systemPrompt, userMessage);
+  if (ctxCheck) {
+    console.log(`  ${c.yellow}⚠ Input ~${Math.round(ctxCheck.estimated/1000)}k tokens (${ctxCheck.pct}% of ${Math.round(ctxCheck.limit/1000)}k context window)${c.reset}`);
+    if (ctxCheck.pct > 100) {
+      return { error: `Input too large (~${Math.round(ctxCheck.estimated/1000)}k tokens) for ${llmConfig.model} (${Math.round(ctxCheck.limit/1000)}k context limit). Try a smaller package or a model with a larger context window.` };
+    }
+  }
+
   let _text = '';
   try {
     let data;
@@ -2598,8 +2631,8 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
       const res = await fetch(llmConfig.url, {
         method: 'POST',
         headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model: llmConfig.model, max_tokens: 8192, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
-        signal: AbortSignal.timeout(120_000),
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(180_000),
       });
       data = await res.json();
       if (data.error) {
@@ -2607,14 +2640,19 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
       }
       _text = data.content?.[0]?.text || '';
+      if (data.stop_reason === 'max_tokens') {
+        console.log(`  ${c.red}✗ Output truncated — model hit max_tokens limit (${data.usage?.output_tokens || '?'} tokens). Results may be incomplete.${c.reset}`);
+        console.log(`  ${c.dim}  Hint: Try a model with higher output capacity, or scan a smaller package.${c.reset}`);
+      }
       const report = extractJSON(_text);
       if (report) {
         report.audit_model = data.model || llmConfig.model;
         report.audit_provider = llmConfig.provider;
         if (data.id) report.provider_msg_id = data.id;
         if (data.usage) { report.input_tokens = data.usage.input_tokens; report.output_tokens = data.usage.output_tokens; }
+        if (data.stop_reason === 'max_tokens') report.output_truncated = true;
       }
-      return { report, text: _text, duration: Date.now() - start };
+      return { report, text: _text, duration: Date.now() - start, truncated: data.stop_reason === 'max_tokens' };
     } else if (llmConfig.type === 'gemini') {
       const res = await fetch(`${llmConfig.url}/${llmConfig.model}:generateContent?key=${apiKey}`, {
         method: 'POST',
@@ -2622,9 +2660,9 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          generationConfig: { maxOutputTokens: 8192 },
+          generationConfig: { maxOutputTokens: 65536, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 8192 } },
         }),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(180_000),
       });
       data = await res.json();
       if (data.error) {
@@ -2632,21 +2670,27 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
       }
       _text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const geminiFinish = data.candidates?.[0]?.finishReason;
+      if (geminiFinish === 'MAX_TOKENS') {
+        console.log(`  ${c.red}✗ Output truncated — model hit maxOutputTokens limit (${data.usageMetadata?.candidatesTokenCount || '?'} tokens). Results may be incomplete.${c.reset}`);
+        console.log(`  ${c.dim}  Hint: Try a model with higher output capacity, or scan a smaller package.${c.reset}`);
+      }
       const report = extractJSON(_text);
       if (report) {
         report.audit_model = data.modelVersion || llmConfig.model;
         report.audit_provider = llmConfig.provider;
         if (data.usageMetadata) { report.input_tokens = data.usageMetadata.promptTokenCount; report.output_tokens = data.usageMetadata.candidatesTokenCount; }
+        if (geminiFinish === 'MAX_TOKENS') report.output_truncated = true;
       }
-      return { report, text: _text, duration: Date.now() - start };
+      return { report, text: _text, duration: Date.now() - start, truncated: geminiFinish === 'MAX_TOKENS' };
     } else {
       const headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
       if (llmConfig.provider === 'openrouter') { headers['HTTP-Referer'] = 'https://agentaudit.dev'; headers['X-Title'] = 'AgentAudit CLI'; }
       const res = await fetch(llmConfig.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ model: llmConfig.model, max_tokens: 8192, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
-        signal: AbortSignal.timeout(120_000),
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(180_000),
       });
       data = await res.json();
       if (data.error) {
@@ -2654,6 +2698,11 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
       }
       _text = data.choices?.[0]?.message?.content || '';
+      const oaiFinish = data.choices?.[0]?.finish_reason;
+      if (oaiFinish === 'length') {
+        console.log(`  ${c.red}✗ Output truncated — model hit max_tokens limit (${data.usage?.completion_tokens || '?'} tokens). Results may be incomplete.${c.reset}`);
+        console.log(`  ${c.dim}  Hint: Try a model with higher output capacity, or scan a smaller package.${c.reset}`);
+      }
       const report = extractJSON(_text);
       if (report) {
         report.audit_model = data.model || llmConfig.model;
@@ -2661,12 +2710,13 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         if (data.id) report.provider_msg_id = data.id;
         if (data.system_fingerprint) report.provider_fingerprint = data.system_fingerprint;
         if (data.usage) { report.input_tokens = data.usage.prompt_tokens; report.output_tokens = data.usage.completion_tokens; }
+        if (oaiFinish === 'length') report.output_truncated = true;
       }
-      return { report, text: _text, duration: Date.now() - start };
+      return { report, text: _text, duration: Date.now() - start, truncated: oaiFinish === 'length' };
     }
   } catch (err) {
     const dur = Date.now() - start;
-    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) return { error: 'Request timed out (120s)', hint: 'Try again or use a faster model', duration: dur };
+    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) return { error: 'Request timed out (180s)', hint: 'Try again or use a faster model', duration: dur };
     if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.message?.includes('fetch failed')) return { error: `Network error: could not reach ${llmConfig.provider}`, hint: 'Check your internet connection', duration: dur };
     return { error: err.message, duration: dur };
   }
@@ -2802,27 +2852,39 @@ function enrichFindings(report, files, pkgInfo) {
 
 async function auditRepo(url) {
   const start = Date.now();
-  const slug = slugFromUrl(url);
-  
+
+  // Support local directories
+  const isLocal = fs.existsSync(url) && fs.statSync(url).isDirectory();
+  const slug = isLocal ? path.basename(url) : slugFromUrl(url);
+
   console.log(`${icons.scan}  ${c.bold}Auditing ${slug}${c.reset}  ${c.dim}${url}${c.reset}`);
   console.log(`${icons.pipe}  ${c.dim}Deep LLM-powered analysis (3-pass: UNDERSTAND → DETECT → CLASSIFY)${c.reset}`);
   console.log();
-  
-  // Step 1: Clone
-  process.stdout.write(`  ${stepProgress(1, 4)} Cloning repository...`);
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentaudit-'));
-  const repoPath = path.join(tmpDir, 'repo');
-  try {
-    safeGitClone(url, repoPath);
+
+  let repoPath, tmpDir = null;
+
+  if (isLocal) {
+    // Local directory — no cloning needed
+    repoPath = path.resolve(url);
+    process.stdout.write(`  ${stepProgress(1, 4)} Reading local directory...`);
     console.log(` ${c.green}done${c.reset}`);
-  } catch (err) {
-    console.log(` ${c.red}failed${c.reset}`);
-    const msg = err.stderr?.toString().trim() || err.message?.split('\n')[0] || '';
-    if (msg) console.log(`    ${c.dim}${msg}${c.reset}`);
-    console.log(`    ${c.dim}Make sure git is installed and the URL is accessible.${c.reset}`);
-    return null;
+  } else {
+    // Step 1: Clone
+    process.stdout.write(`  ${stepProgress(1, 4)} Cloning repository...`);
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentaudit-'));
+    repoPath = path.join(tmpDir, 'repo');
+    try {
+      safeGitClone(url, repoPath);
+      console.log(` ${c.green}done${c.reset}`);
+    } catch (err) {
+      console.log(` ${c.red}failed${c.reset}`);
+      const msg = err.stderr?.toString().trim() || err.message?.split('\n')[0] || '';
+      if (msg) console.log(`    ${c.dim}${msg}${c.reset}`);
+      console.log(`    ${c.dim}Make sure git is installed and the URL is accessible.${c.reset}`);
+      return null;
+    }
   }
-  
+
   // Step 2: Collect files
   process.stdout.write(`  ${stepProgress(2, 4)} Collecting source files...`);
   const files = collectFiles(repoPath);
@@ -2852,8 +2914,8 @@ async function auditRepo(url) {
   if (KNOWN_MCP_LIBS.has(slug)) detectedType = 'library';
   if (KNOWN_CLI.has(slug)) detectedType = 'cli-tool';
 
-  // Cleanup repo (files in memory, provenance captured)
-  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  // Cleanup cloned repo (files in memory, provenance captured); skip for local dirs
+  if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
 
   // Build prompts
   const systemPrompt = auditPrompt || 'You are a security auditor. Analyze the code and report findings as JSON.';
@@ -3126,6 +3188,13 @@ async function auditRepo(url) {
   }
 
   console.log(` ${c.green}done${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
+
+  if (llmResult.truncated) {
+    console.log();
+    console.log(`  ${c.yellow}⚠ WARNING: The model's output was truncated (hit token limit).${c.reset}`);
+    console.log(`  ${c.yellow}  Some findings may be missing from this scan.${c.reset}`);
+    console.log(`  ${c.dim}  Tip: Try a model with more output capacity or scan a smaller package.${c.reset}`);
+  }
 
   const report = llmResult.report;
   if (!report) {
