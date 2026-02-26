@@ -30,6 +30,7 @@ and supply chain attacks. Powered by regex static analysis and deep LLM audits.
 - [What It Detects](#-what-it-detects)
 - [How the 3-Pass Audit Works](#-how-the-3-pass-audit-works)
 - [CI/CD Integration](#-cicd-integration)
+- [Dashboard & Community](#-dashboard--community)
 - [Configuration](#-configuration)
 - [Requirements](#-requirements)
 - [FAQ](#-faq)
@@ -76,22 +77,23 @@ agentaudit lookup fastmcp
 
 **Example output:**
 ```
-  AgentAudit v3.10.0
-  Security scanner for AI packages
+  ⛨ AgentAudit v3.12.9  │  my-scanner #3 · 280pts · 19 audits
 
   Discovering MCP servers in your AI editors...
 
 •  Scanning Cursor  ~/.cursor/mcp.json    found 3 servers
 
 ├──  tool   supabase-mcp              ✔ ok
-│   SAFE  Risk 0  https://agentaudit.dev/packages/supabase-mcp
+│   SAFE  Risk 0  https://agentaudit.dev/skills/supabase-mcp
 ├──  tool   browser-tools-mcp         ✔ ok
 │   ⚠ not audited  Run: agentaudit audit https://github.com/nichochar/browser-tools-mcp
 └──  tool   filesystem                ✔ ok
-│   SAFE  Risk 0  https://agentaudit.dev/packages/filesystem
+│   SAFE  Risk 0  https://agentaudit.dev/skills/filesystem
 
   Looking for general package scanning? Try `pip audit` or `npm audit`.
 ```
+
+> **Enhanced banner:** When logged in, the banner shows your agent name, rank, points, and audit count. Run `agentaudit setup` to create an account.
 
 ### Option B: MCP Server in your AI editor
 
@@ -197,6 +199,8 @@ Then ask your agent: *"Check which MCP servers I have installed and audit any un
 
 ## 📋 Commands Reference
 
+### Scan & Audit
+
 | Command | Description | Example |
 |---------|-------------|---------|
 | `agentaudit` | Discover MCP servers (default, same as `discover`) | `agentaudit` |
@@ -207,18 +211,36 @@ Then ask your agent: *"Check which MCP servers I have installed and audit any un
 | `agentaudit scan <url> --deep` | Deep audit (same as `audit`) | `agentaudit scan https://github.com/owner/repo --deep` |
 | `agentaudit audit <url>` | Deep LLM-powered 3-pass audit (~30s) | `agentaudit audit https://github.com/owner/repo` |
 | `agentaudit lookup <name>` | Look up package in trust registry | `agentaudit lookup fastmcp` |
-| `agentaudit check <name\|url>` | Lookup + auto-audit if not found | `agentaudit check https://github.com/owner/repo` |
-| `agentaudit status` | Check API keys + active LLM provider | `agentaudit status` |
-| `agentaudit setup` | Register agent + configure API key | `agentaudit setup` |
+
+### Community
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `agentaudit dashboard` | `dash` | Interactive full-screen TUI with 5 tabs (Overview, Leaderboard, Benchmark, Activity, Search) |
+| `agentaudit leaderboard` | `lb` | Top contributors ranking (pipe-friendly) |
+| `agentaudit benchmark` | `bench` | LLM model audit performance comparison |
+| `agentaudit activity` | `my` | Your recent audits & findings |
+| `agentaudit search <query>` | `find` | Search packages in the registry by name, ASF-ID, or hash |
+
+### Configuration
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `agentaudit model` | — | Interactive LLM provider + model configuration |
+| `agentaudit setup` | `login` | Sign in with GitHub OAuth or paste API key manually |
+| `agentaudit status` | `whoami` | Show current config, API keys, and personal stats |
 
 ### Global Flags
 
 | Flag | Description |
 |------|-------------|
 | `--json` | Output machine-readable JSON to stdout |
-| `--quiet` / `-q` | Suppress banner and decorative output (show findings only) |
+| `--quiet` / `-q` | Suppress banner and decorative output |
 | `--no-color` | Disable ANSI colors (also respects `NO_COLOR` env var) |
-| `--provider <name>` | Force LLM provider (`anthropic`, `openai`, `openrouter`, `ollama`, `custom`) |
+| `--model <name>` | Override LLM model for this run |
+| `--no-upload` | Skip uploading report to registry |
+| `--export` | Export audit payload as markdown |
+| `--debug` | Show raw LLM response on parse errors |
 | `--help` / `-h` | Show help text |
 | `-v` / `--version` | Show version |
 
@@ -418,35 +440,81 @@ agentaudit lookup fastmcp --json
 
 ---
 
+## 📊 Dashboard & Community
+
+AgentAudit includes a full-screen interactive dashboard and standalone community commands.
+
+### Interactive Dashboard
+
+```bash
+agentaudit dashboard    # or: agentaudit dash
+```
+
+5-tab TUI with keyboard navigation (←→ tabs, ↑↓ scroll, 1-5 jump, q quit):
+
+| Tab | Content |
+|-----|---------|
+| **[1] Overview** | Your profile (rank, points, audits, severity breakdown) + registry stats |
+| **[2] Leaderboard** | Top contributors with medal rankings and bar charts |
+| **[3] Benchmark** | LLM model audit performance comparison |
+| **[4] Activity** | Your recent audits and findings |
+| **[5] Search** | Interactive package search (type to search, Enter to submit) |
+
+### Standalone Commands
+
+All community commands work without the dashboard (pipe-friendly, supports `--json`):
+
+```bash
+agentaudit leaderboard              # Top contributors
+agentaudit leaderboard --tab monthly --json   # Monthly rankings as JSON
+agentaudit benchmark                # Model comparison
+agentaudit activity                 # Your recent audits & findings
+agentaudit search fastmcp           # Search registry by name/ASF-ID
+agentaudit search fastmcp --json    # Machine-readable search results
+```
+
+---
+
 ## ⚙️ Configuration
 
 ### Credentials
 
 AgentAudit stores credentials in `~/.config/agentaudit/credentials.json` (or `$XDG_CONFIG_HOME/agentaudit/credentials.json`).
 
-Run `agentaudit setup` to configure interactively, or set via environment:
+Run `agentaudit setup` to sign in with GitHub or paste an API key, or set via environment:
 
 ```bash
 export AGENTAUDIT_API_KEY=asf_your_key_here
 ```
 
-### Environment Variables
+### LLM Providers (13 supported)
+
+AgentAudit supports 13 LLM providers for deep audits. Set one API key — the CLI auto-detects it. Use `agentaudit model` to choose provider + model interactively, or `agentaudit status` to check your setup.
+
+| Variable | Provider | Default Model |
+|----------|----------|---------------|
+| `ANTHROPIC_API_KEY` | Anthropic (Claude) | `claude-sonnet-4-20250514` |
+| `GEMINI_API_KEY` | Google (Gemini) | `gemini-2.5-flash` |
+| `OPENAI_API_KEY` | OpenAI (GPT-4o) | `gpt-4o` |
+| `DEEPSEEK_API_KEY` | DeepSeek | `deepseek-chat` |
+| `MISTRAL_API_KEY` | Mistral | `mistral-large-latest` |
+| `GROQ_API_KEY` | Groq | `llama-3.3-70b-versatile` |
+| `XAI_API_KEY` | xAI (Grok) | `grok-3` |
+| `TOGETHER_API_KEY` | Together AI | `Llama-3.3-70B-Instruct-Turbo` |
+| `FIREWORKS_API_KEY` | Fireworks AI | `llama-v3p3-70b-instruct` |
+| `CEREBRAS_API_KEY` | Cerebras | `llama-3.3-70b` |
+| `ZAI_API_KEY` | Zhipu AI (GLM) | `glm-4.7` |
+| `OPENROUTER_API_KEY` | OpenRouter | `anthropic/claude-sonnet-4` |
+
+### Other Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `AGENTAUDIT_API_KEY` | API key for registry access |
-| `ANTHROPIC_API_KEY` | Anthropic API key for deep audits (Claude) -- recommended |
-| `OPENAI_API_KEY` | OpenAI API key for deep audits (GPT-4o) |
-| `OPENROUTER_API_KEY` | OpenRouter API key (access 200+ models) |
-| `OPENROUTER_MODEL` | Model to use via OpenRouter (default: `anthropic/claude-sonnet-4`) |
-| `OLLAMA_MODEL` | Ollama model name for local audits (e.g. `llama3.1`, `qwen2.5-coder`) |
-| `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
-| `LLM_API_URL` | Any OpenAI-compatible API endpoint (e.g. LM Studio, vLLM, Together, Groq) |
-| `LLM_API_KEY` | API key for custom endpoint (optional if no auth needed) |
-| `LLM_MODEL` | Model name for custom endpoint |
+| `AGENTAUDIT_API_KEY` | API key for registry uploads (or use `agentaudit setup`) |
+| `AGENTAUDIT_MODEL` | Override LLM model (same as `--model` flag) |
 | `NO_COLOR` | Disable ANSI colors ([no-color.org](https://no-color.org)) |
 
-> **Provider priority:** Anthropic > OpenAI > OpenRouter > Custom > Ollama. Override with `--provider=ollama` etc.
+> **Provider priority:** Set `preferred_provider` via `agentaudit model`, or the CLI picks the first available key. Override per-run with `--model <name>`.
 
 ---
 
@@ -477,49 +545,26 @@ Or use without installing: `npx agentaudit`
 
 ### Setting up your LLM key for deep audits
 
-The `audit` command supports **any LLM provider**. Set one of these environment variables:
+The `audit` command supports **13 LLM providers**. Set one API key and AgentAudit auto-detects it:
 
 ```bash
-# Linux / macOS
-export ANTHROPIC_API_KEY=sk-ant-...       # Recommended (Claude Sonnet)
-export OPENAI_API_KEY=sk-...              # Alternative (GPT-4o)
-export OPENROUTER_API_KEY=sk-or-...       # 200+ models via OpenRouter
-
-# Windows (PowerShell)
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-$env:OPENAI_API_KEY = "sk-..."
-$env:OPENROUTER_API_KEY = "sk-or-..."
-
-# Windows (CMD)
-set ANTHROPIC_API_KEY=sk-ant-...
-set OPENAI_API_KEY=sk-...
-set OPENROUTER_API_KEY=sk-or-...
+# Set any one of these (Anthropic recommended)
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
+export GEMINI_API_KEY=...
+export DEEPSEEK_API_KEY=...
+# ... or any of the 13 supported providers (see Configuration section)
 ```
 
-**Provider priority:** Anthropic > OpenAI > OpenRouter > Custom > Ollama. Override with `--provider=<name>`.
-
-**OpenRouter model selection:** By default uses `anthropic/claude-sonnet-4`. Override with:
+**Interactive setup:**
 ```bash
-export OPENROUTER_MODEL=google/gemini-2.5-pro    # or any model on openrouter.ai
+agentaudit model     # 2-step menu: pick provider → pick model
+agentaudit status    # check which keys are set + current config
 ```
 
-**Local with Ollama (free, no API key):**
+**Override per-run:**
 ```bash
-export OLLAMA_MODEL=llama3.1          # or qwen2.5-coder, deepseek-r1, etc.
-agentaudit audit https://github.com/owner/repo
-```
-> Note: Local models produce lower quality audits than Claude/GPT-4o. Use for quick checks, not production security audits.
-
-**Any OpenAI-compatible API:**
-```bash
-export LLM_API_URL=http://localhost:1234/v1     # LM Studio, vLLM, etc.
-export LLM_MODEL=my-model
-agentaudit audit https://github.com/owner/repo
-```
-
-**Check your setup:**
-```bash
-agentaudit status    # validates all configured API keys
+agentaudit audit https://github.com/owner/repo --model gpt-4o
 ```
 
 **Troubleshooting:** If you see `API error: Incorrect API key`, double-check your key is valid and has credits. Use `--debug` to see the full API response.
@@ -552,8 +597,8 @@ It checks standard config file locations for Claude Desktop, Cursor, VS Code, an
 | 🌐 | [agentaudit.dev](https://agentaudit.dev) | Trust Registry -- browse packages, findings, leaderboard |
 | 🛡️ | [agentaudit-skill](https://github.com/agentaudit-dev/agentaudit-skill) | Agent Skill -- pre-install security gate for Claude Code, Cursor, Windsurf |
 | ⚡ | [agentaudit-github-action](https://github.com/agentaudit-dev/agentaudit-github-action) | GitHub Action -- CI/CD security scanning |
-| 📚 | [agentaudit-mcp](https://github.com/agentaudit-dev/agentaudit-mcp) | This repo -- CLI + MCP server source |
-| 🐛 | [Report Issues](https://github.com/agentaudit-dev/agentaudit-mcp/issues) | Bug reports and feature requests |
+| 📚 | [agentaudit-cli](https://github.com/agentaudit-dev/agentaudit-cli) | This repo -- CLI + MCP server source |
+| 🐛 | [Report Issues](https://github.com/agentaudit-dev/agentaudit-cli/issues) | Bug reports and feature requests |
 
 ---
 
@@ -567,6 +612,6 @@ It checks standard config file locations for Claude Desktop, Cursor, VS Code, an
 
 **Protect your AI stack. Scan before you trust.**
 
-[Trust Registry](https://agentaudit.dev) · [Leaderboard](https://agentaudit.dev/leaderboard) · [Report Issues](https://github.com/agentaudit-dev/agentaudit-mcp/issues)
+[Trust Registry](https://agentaudit.dev) · [Leaderboard](https://agentaudit.dev/leaderboard) · [Report Issues](https://github.com/agentaudit-dev/agentaudit-cli/issues)
 
 </div>
