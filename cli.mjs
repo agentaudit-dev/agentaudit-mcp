@@ -2875,10 +2875,48 @@ async function safeJsonParse(res, llmConfig) {
   }
 }
 
+function getMaxOutputTokens(model) {
+  // Known max_completion_tokens from provider docs (2026-02)
+  // Array (not object) to guarantee match order — specific keys before generic ones
+  const limits = [
+    // Anthropic (specific versions first, then generic)
+    ['claude-haiku-4-5', 8192], ['claude-3-haiku', 4096], ['claude-3-5-haiku', 8192],
+    ['claude-sonnet-4-6', 64000], ['claude-sonnet-4-5', 16384], ['claude-3-5-sonnet', 8192], ['claude-sonnet-4', 16384],
+    ['claude-opus-4-6', 32768], ['claude-opus-4', 32768],
+    // Google Gemini
+    ['gemini-3', 65536], ['gemini-2.5', 65536], ['gemini-2.0', 65536],
+    // Qwen (OpenRouter)
+    ['qwen3.5', 65536], ['qwen3', 32768], ['qwen2.5', 32768],
+    // xAI
+    ['grok-4', 32768], ['grok-3', 16384],
+    // OpenAI
+    ['gpt-4.1', 32768], ['gpt-4o', 16384], ['gpt-4-turbo', 4096], ['o3', 100000], ['o4-mini', 100000],
+    // DeepSeek (8K standard mode — thinking mode allows 64K but we use standard)
+    ['deepseek', 8192],
+    // Mistral
+    ['mistral-large', 32768], ['mistral-medium', 32768], ['mistral-small', 32768],
+    // Meta Llama (served by Groq 32K, Together, Fireworks, Cerebras)
+    ['llama-3.3', 32768], ['llama-v3p3', 32768], ['llama-3.1', 32768], ['llama-v3p1', 32768],
+    ['llama-4', 32768], ['llama-3', 16384],
+    // Zhipu / z.ai
+    ['glm-4', 16384], ['glm-3', 8192],
+  ];
+  const m = (model || '').toLowerCase();
+  for (const [key, val] of limits) {
+    if (m.includes(key)) return val;
+  }
+  return 8192; // conservative fallback — safe for all providers
+}
+
 async function callLlm(llmConfig, systemPrompt, userMessage) {
   const apiKey = process.env[llmConfig.key];
   if (!apiKey) return { error: `Missing API key: ${llmConfig.key}` };
   const start = Date.now();
+
+  // --timeout flag (seconds), default 180s (3 min)
+  const timeoutArgIdx = process.argv.indexOf('--timeout');
+  const timeoutSec = timeoutArgIdx !== -1 ? Math.max(30, Math.min(600, parseInt(process.argv[timeoutArgIdx + 1], 10) || 180)) : 180;
+  const timeoutMs = timeoutSec * 1000;
 
   // Context window warning
   const ctxCheck = checkContextLimit(llmConfig.model, systemPrompt, userMessage);
@@ -2889,6 +2927,17 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
     }
   }
 
+  // Live timer — updates every second while waiting for LLM
+  let liveTimer = null;
+  if (process.stdout.isTTY && !quietMode) {
+    liveTimer = setInterval(() => {
+      const secs = Math.round((Date.now() - start) / 1000);
+      const remaining = timeoutSec - secs;
+      const timerColor = remaining <= 30 ? c.yellow : c.dim;
+      process.stdout.write(`\r  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${llmConfig.name})${c.reset} ${timerColor}${secs}s/${timeoutSec}s${c.reset}  `);
+    }, 1000);
+  }
+
   let _text = '';
   try {
     let data;
@@ -2896,8 +2945,8 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
       const res = await fetch(llmConfig.url, {
         method: 'POST',
         headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
-        signal: AbortSignal.timeout(180_000),
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: getMaxOutputTokens(llmConfig.model), system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       data = await safeJsonParse(res, llmConfig);
       if (data.error) {
@@ -2928,9 +2977,9 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          generationConfig: { maxOutputTokens: 65536, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 8192 } },
+          generationConfig: { maxOutputTokens: getMaxOutputTokens(llmConfig.model), responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 8192 } },
         }),
-        signal: AbortSignal.timeout(180_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       data = await safeJsonParse(res, llmConfig);
       if (data.error) {
@@ -2953,12 +3002,12 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
       return { report, text: _text, duration: Date.now() - start, truncated: geminiFinish === 'MAX_TOKENS' };
     } else {
       const headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-      if (llmConfig.provider === 'openrouter') { headers['HTTP-Referer'] = 'https://agentaudit.dev'; headers['X-Title'] = 'AgentAudit CLI'; }
+      if (llmConfig.provider === 'openrouter') { headers['HTTP-Referer'] = 'https://agentaudit.dev'; headers['X-Title'] = 'AgentAudit CLI'; headers['X-OpenRouter-Categories'] = 'cli-agent'; }
       const res = await fetch(llmConfig.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
-        signal: AbortSignal.timeout(180_000),
+        body: JSON.stringify({ model: llmConfig.model, max_tokens: getMaxOutputTokens(llmConfig.model), messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       data = await safeJsonParse(res, llmConfig);
       if (data.error) {
@@ -2984,9 +3033,11 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
     }
   } catch (err) {
     const dur = Date.now() - start;
-    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) return { error: 'Request timed out (180s)', hint: 'Try again or use a faster model', duration: dur };
+    if (err.name === 'TimeoutError' || err.message?.includes('timeout')) return { error: `Request timed out (${timeoutSec}s)`, hint: `Increase timeout: --timeout ${timeoutSec * 2}`, duration: dur };
     if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.message?.includes('fetch failed')) return { error: `Network error: could not reach ${llmConfig.provider}`, hint: 'Check your internet connection', duration: dur };
     return { error: err.message, duration: dur };
+  } finally {
+    if (liveTimer) clearInterval(liveTimer);
   }
 }
 
@@ -3794,14 +3845,16 @@ async function auditRepo(url) {
 
   const llmResult = await callLlm(activeLlm, systemPrompt, userMessage);
 
+  // Clear live timer line and print final status
+  if (process.stdout.isTTY) process.stdout.write('\r\x1b[K');
   if (llmResult.error) {
-    console.log(` ${c.red}failed${c.reset}`);
+    console.log(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${modelLabel})${c.reset} ${c.red}failed${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
     console.log(`  ${c.red}${llmResult.error}${c.reset}`);
     if (llmResult.hint) console.log(`  ${c.dim}${llmResult.hint}${c.reset}`);
     return null;
   }
 
-  console.log(` ${c.green}done${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
+  console.log(`  ${stepProgress(4, 4)} Running LLM analysis ${c.dim}(${modelLabel})${c.reset} ${c.green}done${c.reset} ${c.dim}(${elapsed(start)})${c.reset}`);
 
   if (llmResult.truncated) {
     console.log();
@@ -5210,11 +5263,13 @@ async function main() {
   // Strip global flags from args (including --model <value>, --format <value>)
   const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color', '--no-upload', '--remote']);
   let args = rawArgs.filter(a => !globalFlags.has(a));
-  // Remove --model <value> and --models <value> pairs
+  // Remove --model <value>, --models <value>, --timeout <value> pairs
   const modelIdx = args.indexOf('--model');
   if (modelIdx !== -1) args.splice(modelIdx, 2);
   const modelsIdx = args.indexOf('--models');
   if (modelsIdx !== -1) args.splice(modelsIdx, 2);
+  const timeoutIdx = args.indexOf('--timeout');
+  if (timeoutIdx !== -1) args.splice(timeoutIdx, 2);
   // Remove --format <value> pair
   const formatIdx = args.indexOf('--format');
   const formatFlag = formatIdx !== -1 ? args.splice(formatIdx, 2)[1] : null;
@@ -5290,6 +5345,7 @@ async function main() {
       `                       <name> — specific model as verifier (e.g. sonnet)`,
       `  --no-verify        Disable verification (even if default)`,
       `  --remote           Use agentaudit.dev server (no LLM key needed, 3/day free)`,
+      `  --timeout <sec>    LLM request timeout in seconds (default: 180, max: 600)`,
       `  --model <name>     Override LLM model for this run`,
       `  --models <a,b,c>   Multi-model audit (parallel calls, consensus comparison)`,
       `  --no-upload        Skip uploading report to registry`,
