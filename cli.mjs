@@ -64,7 +64,7 @@ const LLM_PROVIDERS = [
   { key: 'DEEPSEEK_API_KEY',    name: 'DeepSeek',              provider: 'deepseek',    type: 'openai',    model: 'deepseek-chat',             url: 'https://api.deepseek.com/v1/chat/completions' },
   { key: 'MISTRAL_API_KEY',     name: 'Mistral',               provider: 'mistral',     type: 'openai',    model: 'mistral-large-latest',      url: 'https://api.mistral.ai/v1/chat/completions' },
   { key: 'GROQ_API_KEY',        name: 'Groq',                  provider: 'groq',        type: 'openai',    model: 'llama-3.3-70b-versatile',   url: 'https://api.groq.com/openai/v1/chat/completions' },
-  { key: 'XAI_API_KEY',         name: 'xAI (Grok)',            provider: 'xai',         type: 'openai',    model: 'grok-3',                    url: 'https://api.x.ai/v1/chat/completions' },
+  { key: 'XAI_API_KEY',         name: 'xAI (Grok)',            provider: 'xai',         type: 'openai',    model: 'grok-4',                    url: 'https://api.x.ai/v1/chat/completions' },
   { key: 'TOGETHER_API_KEY',    name: 'Together AI',           provider: 'together',    type: 'openai',    model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', url: 'https://api.together.xyz/v1/chat/completions' },
   { key: 'FIREWORKS_API_KEY',   name: 'Fireworks AI',          provider: 'fireworks',   type: 'openai',    model: 'accounts/fireworks/models/llama-v3p3-70b-instruct', url: 'https://api.fireworks.ai/inference/v1/chat/completions' },
   { key: 'CEREBRAS_API_KEY',    name: 'Cerebras',              provider: 'cerebras',    type: 'openai',    model: 'llama-3.3-70b',             url: 'https://api.cerebras.ai/v1/chat/completions' },
@@ -78,15 +78,16 @@ const LLM_PROVIDERS = [
 const PROVIDER_MODELS = {
   anthropic: [
     { label: 'claude-sonnet-4-20250514', sublabel: 'fast + smart (default)', value: 'claude-sonnet-4-20250514' },
-    { label: 'claude-opus-4-20250514',   sublabel: 'most capable',           value: 'claude-opus-4-20250514' },
+    { label: 'claude-opus-4-20250514',   sublabel: 'best precision (recommended for audits)', value: 'claude-opus-4-20250514' },
   ],
   openai: [
     { label: 'gpt-4o',  sublabel: 'fast multimodal (default)', value: 'gpt-4o' },
-    { label: 'gpt-4.1', sublabel: 'latest',                    value: 'gpt-4.1' },
+    { label: 'gpt-4.1', sublabel: 'large context (low recall on audits)', value: 'gpt-4.1' },
   ],
   google: [
     { label: 'gemini-2.5-flash', sublabel: 'fast + cheap (default)', value: 'gemini-2.5-flash' },
-    { label: 'gemini-2.5-pro',   sublabel: 'most capable',          value: 'gemini-2.5-pro' },
+    { label: 'gemini-2.5-pro',   sublabel: 'strong reasoning',      value: 'gemini-2.5-pro' },
+    { label: 'gemini-3.1-pro',   sublabel: 'best detection (recommended for audits)', value: 'gemini-3.1-pro' },
   ],
   deepseek: [
     { label: 'deepseek-chat', sublabel: 'cost-effective (default)', value: 'deepseek-chat' },
@@ -98,7 +99,8 @@ const PROVIDER_MODELS = {
     { label: 'llama-3.3-70b-versatile', sublabel: 'ultra-fast (default)', value: 'llama-3.3-70b-versatile' },
   ],
   xai: [
-    { label: 'grok-3', sublabel: 'real-time knowledge (default)', value: 'grok-3' },
+    { label: 'grok-4', sublabel: 'best detection (default, recommended)', value: 'grok-4' },
+    { label: 'grok-3', sublabel: 'faster, lower cost',                    value: 'grok-3' },
   ],
   together: [
     { label: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', sublabel: 'open source (default)', value: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
@@ -267,6 +269,14 @@ function resolveProvider() {
 }
 
 function resolveModel(modelName) {
+  // Shorthand aliases for recommended models
+  const aliases = {
+    'opus': 'claude-opus-4-20250514',
+    'sonnet': 'claude-sonnet-4-20250514',
+    'gemini-3.1-pro': 'google/gemini-3.1-pro-preview',
+    'gemini-3.1-flash': 'google/gemini-3.1-flash-preview',
+  };
+  if (aliases[modelName.toLowerCase()]) modelName = aliases[modelName.toLowerCase()];
   // model with '/' → OpenRouter
   if (modelName.includes('/')) {
     const p = LLM_PROVIDERS.find(p => p.provider === 'openrouter' && process.env[p.key]);
@@ -994,11 +1004,16 @@ function fmtPct(n) {
 
 function dashboardBanner() {
   const ver = getVersion();
+  const inner = 35;
+  const line1 = `  \u25C6  AgentAudit  v${ver}`;
+  const line2 = `  Security Registry for AI Agents`;
+  const pad1 = Math.max(0, inner - line1.length);
+  const pad2 = Math.max(0, inner - line2.length);
   return [
-    `  ${BOX.tl}${c.dim}${BOX.h.repeat(35)}${c.reset}${BOX.tr}`,
-    `  ${BOX.v}  ${c.bold}${c.cyan}◆  AgentAudit${c.reset}  ${c.dim}v${ver}${c.reset}${' '.repeat(Math.max(0, 19 - ver.length))}${BOX.v}`,
-    `  ${BOX.v}  ${c.dim}Security Registry for AI Agents${c.reset}  ${BOX.v}`,
-    `  ${BOX.bl}${c.dim}${BOX.h.repeat(35)}${c.reset}${BOX.br}`,
+    `  ${BOX.tl}${c.dim}${BOX.h.repeat(inner)}${c.reset}${BOX.tr}`,
+    `  ${BOX.v}${c.bold}${c.cyan}${line1}${c.reset}${' '.repeat(pad1)}${BOX.v}`,
+    `  ${BOX.v}${c.dim}${line2}${c.reset}${' '.repeat(pad2)}${BOX.v}`,
+    `  ${BOX.bl}${c.dim}${BOX.h.repeat(inner)}${c.reset}${BOX.br}`,
   ];
 }
 
@@ -2807,18 +2822,26 @@ Decision rules: code_exists=false→REJECTED; code_matches_description=false→R
 
 // Known context window sizes (input tokens) for common models
 const MODEL_CONTEXT_LIMITS = {
+  'claude-sonnet-4-6': 200000, 'claude-opus-4-6': 200000,
   'claude-sonnet-4': 200000, 'claude-opus-4': 200000, 'claude-haiku-4': 200000,
   'claude-3.5-sonnet': 200000, 'claude-3-haiku': 200000,
+  'gpt-4.1': 1047576, 'gpt-4.1-mini': 1047576, 'gpt-4.1-nano': 1047576,
   'gpt-4o': 128000, 'gpt-4o-mini': 128000, 'gpt-4-turbo': 128000, 'gpt-4': 8192,
+  'gemini-3.1-pro': 1048576, 'gemini-3.1-flash': 1048576,
   'gemini-2.5-flash': 1048576, 'gemini-2.5-pro': 1048576, 'gemini-2.0-flash': 1048576,
+  'grok-4': 256000, 'grok-3': 131072,
   'deepseek-chat': 64000, 'deepseek-reasoner': 64000,
   'mistral-large': 128000, 'mistral-small': 32000,
 };
 
 function estimateTokens(text) { return Math.ceil(text.length / 3.5); }
 
+// Sorted keys: longest first so "gpt-4.1" matches before "gpt-4", "claude-sonnet-4-6" before "claude-sonnet-4"
+const MODEL_LIMIT_KEYS = Object.keys(MODEL_CONTEXT_LIMITS).sort((a, b) => b.length - a.length);
+
 function checkContextLimit(model, systemPrompt, userMessage) {
-  const modelKey = Object.keys(MODEL_CONTEXT_LIMITS).find(k => model.toLowerCase().includes(k.toLowerCase()));
+  const stripped = model.replace(/^(anthropic|openai|google|openrouter|meta-llama|mistralai)\//i, '').toLowerCase();
+  const modelKey = MODEL_LIMIT_KEYS.find(k => stripped.includes(k.toLowerCase()));
   if (!modelKey) return null; // unknown model, skip check
   const limit = MODEL_CONTEXT_LIMITS[modelKey];
   const estimated = estimateTokens(systemPrompt) + estimateTokens(userMessage);
@@ -3688,12 +3711,17 @@ async function auditRepo(url) {
   if (modelNames.length === 1) {
     activeLlm = resolveModel(modelNames[0]);
   } else {
-    activeLlm = resolveProvider();
     // Model override: --model flag > AGENTAUDIT_MODEL env > credentials.json > provider default
     const modelArgIdx2 = process.argv.indexOf('--model');
     const modelFlag2 = modelArgIdx2 !== -1 ? process.argv[modelArgIdx2 + 1] : null;
     const modelOverride = modelFlag2 || process.env.AGENTAUDIT_MODEL || loadLlmConfig()?.llm_model || null;
-    if (activeLlm && modelOverride) activeLlm.model = modelOverride;
+    if (modelOverride) {
+      // Route through resolveModel() so slash-models go to OpenRouter, prefixes to native providers
+      activeLlm = resolveModel(modelOverride);
+    }
+    if (!activeLlm) {
+      activeLlm = resolveProvider();
+    }
   }
 
   if (!activeLlm) {
@@ -4234,7 +4262,14 @@ async function fetchDashboardData() {
   return { stats, leaderboard, benchmark, agent, creds };
 }
 
-function renderOverviewTab(data, width) {
+const QUICK_ACTIONS = [
+  { key: 'a', label: 'Audit', arg: '<url>', desc: 'Deep LLM security audit', cmd: 'audit' },
+  { key: 'v', label: 'Audit --verify', arg: '<url>', desc: 'Audit + adversarial verification', cmd: 'audit-verify' },
+  { key: 'r', label: 'Remote scan', arg: '<url>', desc: 'Server-side scan (no API key)', cmd: 'remote' },
+  { key: 'c', label: 'Consensus', arg: '<pkg>', desc: 'Cross-model consensus view', cmd: 'consensus' },
+];
+
+function renderOverviewTab(data, width, quickActionIdx = -1) {
   const { stats, agent, leaderboard, creds } = data;
   const lines = [];
   const halfW = Math.min(Math.floor((width - 6) / 2), 40);
@@ -4325,14 +4360,17 @@ function renderOverviewTab(data, width) {
     lines.push(`  ${c.dim}Local:${c.reset} ${histParts.join(`  ${c.dim}│${c.reset}  `)}`);
   }
 
-  // Quick actions
+  // Quick actions (interactive)
   lines.push('');
-  lines.push(`  ${c.bold}Quick Actions${c.reset}`);
-  lines.push(`  ${c.cyan}agentaudit audit <url>${c.reset}            ${c.dim}Deep LLM security audit${c.reset}`);
-  lines.push(`  ${c.cyan}agentaudit audit <url> --verify${c.reset}   ${c.dim}Audit + adversarial verification${c.reset}`);
-  lines.push(`  ${c.cyan}agentaudit audit <url> --remote${c.reset}   ${c.dim}Server-side scan (no API key)${c.reset}`);
-  lines.push(`  ${c.cyan}agentaudit consensus <pkg>${c.reset}        ${c.dim}Cross-model consensus view${c.reset}`);
-  lines.push(`  ${c.cyan}agentaudit search <query>${c.reset}         ${c.dim}Search the registry${c.reset}`);
+  lines.push(`  ${c.bold}Quick Actions${c.reset}  ${c.dim}(press key or Enter to launch)${c.reset}`);
+  for (let i = 0; i < QUICK_ACTIONS.length; i++) {
+    const qa = QUICK_ACTIONS[i];
+    const isSel = i === quickActionIdx;
+    const pointer = isSel ? `${c.cyan}\u276F${c.reset}` : ' ';
+    const keyBadge = `${c.dim}[${c.reset}${c.cyan}${qa.key}${c.reset}${c.dim}]${c.reset}`;
+    const label = isSel ? `${c.bold}${c.cyan}${qa.label} ${qa.arg}${c.reset}` : `${qa.label} ${c.dim}${qa.arg}${c.reset}`;
+    lines.push(` ${pointer} ${keyBadge}  ${label}  ${c.dim}${qa.desc}${c.reset}`);
+  }
 
   return lines;
 }
@@ -4852,6 +4890,8 @@ async function dashboardCommand() {
   let activeTab = 0;
   let scrollOffset = 0;
   let running = true;
+  let quickActionIdx = 0; // selected quick action on overview tab
+  let pendingAction = null; // set when user triggers a quick action
 
   // Search tab state
   let searchQuery = '';
@@ -4917,7 +4957,7 @@ async function dashboardCommand() {
     let contentLines = [];
     switch (activeTab) {
       case 0:
-        contentLines = renderOverviewTab(data, cols);
+        contentLines = renderOverviewTab(data, cols, quickActionIdx);
         break;
       case 1:
         contentLines = renderLeaderboardTab(data, cols);
@@ -4946,9 +4986,12 @@ async function dashboardCommand() {
     output += '\n';
     const scrollInfo = contentLines.length > availableRows ? `  ${c.dim}[${scrollOffset + 1}-${Math.min(scrollOffset + availableRows, contentLines.length)}/${contentLines.length}]${c.reset}` : '';
     const isSearchTab = activeTab === 4;
+    const isOverviewTab = activeTab === 0;
     const footerHint = isSearchTab
       ? `${c.dim}\u2190\u2192 tab  Enter=search  Esc=clear  q quit${c.reset}`
-      : `${c.dim}\u2190\u2192 tab  \u2191\u2193 scroll  1-5 jump  q quit${c.reset}`;
+      : isOverviewTab
+        ? `${c.dim}\u2190\u2192 tab  \u2191\u2193 select  Enter=launch  a/v/r/c shortcut  q quit${c.reset}`
+        : `${c.dim}\u2190\u2192 tab  \u2191\u2193 scroll  1-5 jump  q quit${c.reset}`;
     output += `  ${footerHint}${scrollInfo}\n`;
 
     process.stdout.write(output);
@@ -5058,7 +5101,36 @@ async function dashboardCommand() {
       return;
     }
 
-    // Scroll
+    // Overview tab: quick action navigation + launch
+    if (activeTab === 0) {
+      // ↑↓ / j/k move quick action cursor
+      if (key === '\x1b[A' || key === 'k') {
+        quickActionIdx = (quickActionIdx - 1 + QUICK_ACTIONS.length) % QUICK_ACTIONS.length;
+        render();
+        return;
+      }
+      if (key === '\x1b[B' || key === 'j') {
+        quickActionIdx = (quickActionIdx + 1) % QUICK_ACTIONS.length;
+        render();
+        return;
+      }
+      // Enter: launch selected quick action
+      if (key === '\r' || key === '\n') {
+        pendingAction = QUICK_ACTIONS[quickActionIdx].cmd;
+        cleanup();
+        return;
+      }
+      // Letter shortcuts: a/v/r/c
+      const qaMatch = QUICK_ACTIONS.find(qa => qa.key === key);
+      if (qaMatch) {
+        pendingAction = qaMatch.cmd;
+        cleanup();
+        return;
+      }
+      return;
+    }
+
+    // Other tabs: scroll
     if (key === '\x1b[A' || key === 'k') { scrollOffset = Math.max(0, scrollOffset - 1); render(); return; }
     if (key === '\x1b[B' || key === 'j') { scrollOffset++; render(); return; }
     if (key === '\x1b[5~') { scrollOffset = Math.max(0, scrollOffset - 10); render(); return; }
@@ -5086,6 +5158,37 @@ async function dashboardCommand() {
       if (!running) { clearInterval(check); resolve(); }
     }, 100);
   });
+
+  // Handle pending quick action after dashboard exits
+  if (pendingAction) {
+    const qa = QUICK_ACTIONS.find(q => q.cmd === pendingAction);
+    const promptLabel = qa?.arg === '<pkg>' ? 'Package name' : 'URL to audit';
+    console.log();
+    const input = await askQuestion(`  ${c.cyan}${promptLabel}:${c.reset} `);
+    if (!input) {
+      console.log(`  ${c.dim}Cancelled.${c.reset}`);
+      return;
+    }
+    console.log();
+    // Build argv and re-enter main()
+    const newArgs = ['node', 'cli.mjs'];
+    switch (pendingAction) {
+      case 'audit':
+        newArgs.push('audit', input);
+        break;
+      case 'audit-verify':
+        newArgs.push('audit', input, '--verify', 'self');
+        break;
+      case 'remote':
+        newArgs.push('audit', input, '--remote');
+        break;
+      case 'consensus':
+        newArgs.push('consensus', input);
+        break;
+    }
+    process.argv = newArgs;
+    await main();
+  }
 }
 
 // ── Main ────────────────────────────────────────────────
@@ -5200,7 +5303,7 @@ async function main() {
       `  agentaudit audit https://github.com/owner/repo --verify cross`,
       `  agentaudit audit https://github.com/owner/repo --remote`,
       `  agentaudit audit https://github.com/owner/repo --model gpt-4o`,
-      `  agentaudit audit https://github.com/owner/repo --models gemini-2.5-flash,claude-sonnet-4-20250514`,
+      `  agentaudit audit https://github.com/owner/repo --models opus,sonnet,grok-4,gemini-3.1-pro`,
       `  agentaudit audit https://github.com/owner/repo --format sarif > results.sarif`,
       `  agentaudit audit https://github.com/owner/repo --export`,
     ],
@@ -5480,7 +5583,7 @@ async function main() {
     console.log(`    agentaudit discover --quick`);
     console.log(`    agentaudit scan https://github.com/owner/repo`);
     console.log(`    agentaudit audit https://github.com/owner/repo`);
-    console.log(`    agentaudit audit <url> --models gemini-2.5-flash,claude-sonnet-4-20250514`);
+    console.log(`    agentaudit audit <url> --models opus,sonnet,grok-4,gemini-3.1-pro`);
     console.log(`    agentaudit lookup fastmcp --json`);
     console.log();
     console.log(`  ${c.bold}LEARN MORE${c.reset}`);
@@ -6002,6 +6105,13 @@ async function main() {
       console.log(`  Active:  ${c.yellow}no provider configured${c.reset}`);
     }
     console.log();
+    console.log(`  ${c.dim}Recommended for deep audits (validated on real-world CVEs):${c.reset}`);
+    console.log(`  ${c.dim}  Anthropic  claude-opus-4    — best precision${c.reset}`);
+    console.log(`  ${c.dim}  Anthropic  claude-sonnet-4  — best value${c.reset}`);
+    console.log(`  ${c.dim}  xAI        grok-4           — complementary detection${c.reset}`);
+    console.log(`  ${c.dim}  Google     gemini-3.1-pro   — deepest analysis${c.reset}`);
+    console.log(`  ${c.dim}  For multi-model consensus:  agentaudit audit <url> --models opus,sonnet,grok-4,gemini-3.1-pro${c.reset}`);
+    console.log();
 
     // Step A: Provider selection
     const providerChoices = [
@@ -6313,7 +6423,16 @@ async function main() {
   }
   
   if (command === 'audit') {
-    const urls = targets.filter(t => !t.startsWith('--'));
+    // Extract URLs: skip option flags and their values
+    const optionsWithValues = new Set(['--model', '--verify', '--format', '--models']);
+    const urls = [];
+    for (let i = 0; i < targets.length; i++) {
+      if (targets[i].startsWith('--')) {
+        if (optionsWithValues.has(targets[i]) && i + 1 < targets.length) i++; // skip next (value)
+        continue;
+      }
+      urls.push(targets[i]);
+    }
     if (urls.length === 0) {
       console.log(`  ${c.red}Error: at least one repository URL required${c.reset}`);
       console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit audit <url>${c.dim} — e.g. agentaudit audit https://github.com/owner/repo${c.reset}`);
