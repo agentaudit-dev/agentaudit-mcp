@@ -36,6 +36,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(__dirname);
 const REGISTRY_URL = 'https://agentaudit.dev';
 
+// ── Global error handlers — catch unhandled errors and exit cleanly ────
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`\nagentaudit: fatal error — ${err.message || err}\n`);
+  if (process.argv.includes('--debug')) process.stderr.write(`${err.stack || ''}\n`);
+  process.exit(2);
+});
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  process.stderr.write(`\nagentaudit: unhandled promise rejection — ${msg}\n`);
+  if (process.argv.includes('--debug') && reason instanceof Error) process.stderr.write(`${reason.stack || ''}\n`);
+  process.exit(2);
+});
+
 // ── Global flags (set in main before command routing) ────
 let jsonMode = false;
 let quietMode = false;
@@ -367,21 +380,23 @@ function multiSelect(items, { title = 'Select items', hint = 'Space=toggle  ↑�
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     
+    const cleanup = () => {
+      try { process.stdin.setRawMode(false); } catch {}
+      process.stdin.pause();
+      process.stdin.removeListener('data', onData);
+    };
+
     const onData = (key) => {
-      // Ctrl+C
+      // Ctrl+C — restore terminal state and exit cleanly
       if (key === '\x03') {
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
-        process.stdin.removeListener('data', onData);
+        cleanup();
         console.log();
-        process.exitCode = 0; return;
+        process.exit(0);
       }
       
       // Enter
       if (key === '\r' || key === '\n') {
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
-        process.stdin.removeListener('data', onData);
+        cleanup();
         resolve(items.filter((_, i) => selected.has(i)).map(i => i.value));
         return;
       }
@@ -837,17 +852,45 @@ function padLeft(str, len) {
   return diff > 0 ? ' '.repeat(diff) + str : str;
 }
 
+// Truncate a string with ANSI codes to maxLen visible characters
+function truncateAnsi(str, maxLen) {
+  if (maxLen <= 0) return '';
+  let vis = 0;
+  let result = '';
+  let i = 0;
+  while (i < str.length) {
+    if (str[i] === '\x1b') {
+      const m = str.slice(i).match(/^\x1b\[[0-9;]*[a-zA-Z]/);
+      if (m) { result += m[0]; i += m[0].length; continue; }
+    }
+    if (vis >= maxLen) break;
+    result += str[i];
+    vis++;
+    i++;
+  }
+  return result + c.reset;
+}
+
 function drawBox(title, contentLines, width) {
   const inner = width - 4; // 2 for "│ " + 2 for " │"
   const totalDash = inner + 2; // total horizontal line chars between corners
   const lines = [];
-  const titleStr = title ? ` ${title} ` : '';
-  const titleLen = visLen(titleStr);
+  let titleStr = title ? ` ${title} ` : '';
+  let titleLen = visLen(titleStr);
+  // Clamp title if wider than available border space
+  if (titleLen >= totalDash - 1) {
+    const maxTitle = Math.max(1, totalDash - 4);
+    titleStr = ` ${title.slice(0, maxTitle)}… `;
+    titleLen = visLen(titleStr);
+  }
   // Top: ╭─ Title ────────────╮  (1 dash before title + title + remaining dashes)
-  const topDash = BOX.h.repeat(Math.max(1, totalDash - 1 - titleLen));
+  const topDash = BOX.h.repeat(Math.max(0, totalDash - 1 - titleLen));
   lines.push(`  ${BOX.tl}${c.dim}${BOX.h}${c.reset}${c.bold}${titleStr}${c.reset}${c.dim}${topDash}${c.reset}${BOX.tr}`);
   for (const line of contentLines) {
-    lines.push(`  ${BOX.v} ${padRight(line, inner + 1)}${BOX.v}`);
+    // Truncate content that exceeds box inner width
+    const vl = visLen(line);
+    const display = vl > inner ? truncateAnsi(line, inner - 1) + '…' : line;
+    lines.push(`  ${BOX.v} ${padRight(display, inner + 1)}${BOX.v}`);
   }
   lines.push(`  ${BOX.bl}${c.dim}${BOX.h.repeat(totalDash)}${c.reset}${BOX.br}`);
   return lines;
@@ -1001,23 +1044,34 @@ function formatApiError(error, provider, statusCode) {
   return null;
 }
 
+/**
+ * Validate that a parsed object looks like a valid audit report.
+ * Must have at least: findings (array) and one of skill_slug/risk_score/result.
+ */
+function isValidReportSchema(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  if (!Array.isArray(obj.findings)) return false;
+  // Must have at least one identifying field
+  if (!('skill_slug' in obj) && !('risk_score' in obj) && !('result' in obj)) return false;
+  return true;
+}
+
 function extractJSON(text) {
   // 1. Try parsing the entire text as JSON directly
-  try { return JSON.parse(text.trim()); } catch {}
-  
+  try {
+    const parsed = JSON.parse(text.trim());
+    if (isValidReportSchema(parsed)) return parsed;
+  } catch {}
+
   // 2. Strip markdown code fences — try last fence first (report is usually at the end)
   const fenceMatches = [...text.matchAll(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/g)];
   for (let i = fenceMatches.length - 1; i >= 0; i--) {
-    try { 
+    try {
       const parsed = JSON.parse(fenceMatches[i][1].trim());
-      if (parsed && typeof parsed === 'object' && ('risk_score' in parsed || 'findings' in parsed || 'result' in parsed)) return parsed;
+      if (isValidReportSchema(parsed)) return parsed;
     } catch {}
   }
-  // Try any fence even without report keys
-  for (let i = fenceMatches.length - 1; i >= 0; i--) {
-    try { return JSON.parse(fenceMatches[i][1].trim()); } catch {}
-  }
-  
+
   // 3. Find ALL balanced top-level { ... } blocks, try each (prefer largest valid one)
   const blocks = [];
   let searchFrom = 0;
@@ -1045,9 +1099,12 @@ function extractJSON(text) {
   // Try largest block first (the report JSON is usually the biggest)
   blocks.sort((a, b) => b.length - a.length);
   for (const block of blocks) {
-    try { return JSON.parse(block); } catch {}
+    try {
+      const parsed = JSON.parse(block);
+      if (isValidReportSchema(parsed)) return parsed;
+    } catch {}
   }
-  
+
   return null;
 }
 
@@ -1067,8 +1124,15 @@ const SKIP_EXTENSIONS = new Set([
   '.dylib', '.dll', '.exe', '.bin', '.dat', '.db', '.sqlite',
 ]);
 
-function collectFiles(dir, basePath = '', collected = [], totalSize = { bytes: 0 }) {
+function collectFiles(dir, basePath = '', collected = [], totalSize = { bytes: 0 }, _visitedPaths = new Set()) {
   if (totalSize.bytes >= MAX_TOTAL_SIZE) return collected;
+
+  // Symlink loop protection: resolve real path and track visited directories
+  let realDir;
+  try { realDir = fs.realpathSync(dir); } catch { return collected; }
+  if (_visitedPaths.has(realDir)) return collected;
+  _visitedPaths.add(realDir);
+
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch { return collected; }
@@ -1077,15 +1141,24 @@ function collectFiles(dir, basePath = '', collected = [], totalSize = { bytes: 0
     if (totalSize.bytes >= MAX_TOTAL_SIZE) break;
     const relPath = basePath ? `${basePath}/${entry.name}` : entry.name;
     const fullPath = path.join(dir, entry.name);
+
+    // Skip symlinks that point to directories (prevent symlink traversal attacks)
+    if (entry.isSymbolicLink()) {
+      try {
+        const target = fs.realpathSync(fullPath);
+        if (fs.statSync(target).isDirectory()) continue; // skip symlinked dirs entirely
+      } catch { continue; }
+    }
+
     if (entry.isDirectory()) {
       // Special: scan .github/workflows/ (security-critical CI/CD files)
       if (entry.name === '.github') {
         const wfDir = path.join(fullPath, 'workflows');
-        try { if (fs.statSync(wfDir).isDirectory()) collectFiles(wfDir, relPath + '/workflows', collected, totalSize); } catch {}
+        try { if (fs.statSync(wfDir).isDirectory()) collectFiles(wfDir, relPath + '/workflows', collected, totalSize, _visitedPaths); } catch {}
         continue;
       }
       if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
-      collectFiles(fullPath, relPath, collected, totalSize);
+      collectFiles(fullPath, relPath, collected, totalSize, _visitedPaths);
     } else {
       const ext = path.extname(entry.name).toLowerCase();
       if (SKIP_EXTENSIONS.has(ext)) continue;
@@ -2722,6 +2795,16 @@ function loadAuditPrompt() {
   return null;
 }
 
+function loadVerificationPrompt() {
+  const promptPath = path.join(SKILL_DIR, 'prompts', 'verification-prompt.md');
+  if (fs.existsSync(promptPath)) return fs.readFileSync(promptPath, 'utf8');
+  // Fallback: embedded minimal prompt
+  return `You are a security verification auditor. Your job is to CHALLENGE a finding from a security scan.
+Verify whether the cited code exists and the vulnerability is real. Respond with ONLY a JSON object:
+{"verification_status":"verified|demoted|rejected","original_severity":"...","verified_severity":"...","verified_confidence":"high|medium|low","code_exists":true|false,"code_matches_description":true|false,"is_opt_in":true|false,"is_core_functionality":true|false,"attack_scenario":"...","rejection_reason":"...","reasoning":"..."}
+Decision rules: code_exists=false→REJECTED; code_matches_description=false→REJECTED; is_opt_in=true AND severity critical/high→DEMOTED to low; no attack_scenario AND severity critical/high→DEMOTED to medium.`;
+}
+
 // Known context window sizes (input tokens) for common models
 const MODEL_CONTEXT_LIMITS = {
   'claude-sonnet-4': 200000, 'claude-opus-4': 200000, 'claude-haiku-4': 200000,
@@ -2743,6 +2826,30 @@ function checkContextLimit(model, systemPrompt, userMessage) {
     return { estimated, limit, pct: Math.round(estimated / limit * 100) };
   }
   return null;
+}
+
+/**
+ * Safely parse JSON from a fetch response. If the response is not JSON
+ * (e.g. HTML error page from a 502/503), returns {error: {message: ...}}
+ * which the callLlm error handling paths already handle.
+ */
+async function safeJsonParse(res, llmConfig) {
+  const contentType = res.headers.get('content-type') || '';
+  // Read body as text first — we can only consume the stream once
+  let body;
+  try { body = await res.text(); } catch { body = ''; }
+
+  if (!res.ok && !contentType.includes('application/json')) {
+    // Non-JSON error response (e.g. HTML from a proxy/gateway)
+    const preview = body.slice(0, 200).replace(/<[^>]+>/g, '').trim();
+    return { error: { message: `HTTP ${res.status} from ${llmConfig.provider}${preview ? ': ' + preview : ''}` } };
+  }
+  try {
+    return JSON.parse(body);
+  } catch (parseErr) {
+    const preview = body.slice(0, 200).replace(/<[^>]+>/g, '').trim();
+    return { error: { message: `Invalid JSON from ${llmConfig.provider} (HTTP ${res.status}): ${preview || parseErr.message}` } };
+  }
 }
 
 async function callLlm(llmConfig, systemPrompt, userMessage) {
@@ -2769,7 +2876,7 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, system: systemPrompt, messages: [{ role: 'user', content: userMessage }] }),
         signal: AbortSignal.timeout(180_000),
       });
-      data = await res.json();
+      data = await safeJsonParse(res, llmConfig);
       if (data.error) {
         const friendly = formatApiError(data.error, llmConfig.provider, res.status);
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
@@ -2789,7 +2896,10 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
       }
       return { report, text: _text, duration: Date.now() - start, truncated: data.stop_reason === 'max_tokens' };
     } else if (llmConfig.type === 'gemini') {
-      const res = await fetch(`${llmConfig.url}/${llmConfig.model}:generateContent?key=${apiKey}`, {
+      // NOTE: Google's Gemini API requires the API key as a URL query parameter.
+      // This is by design (their auth model). We never log the full URL to avoid key leakage.
+      const geminiUrl = `${llmConfig.url}/${llmConfig.model}:generateContent?key=${apiKey}`;
+      const res = await fetch(geminiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2799,7 +2909,7 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         }),
         signal: AbortSignal.timeout(180_000),
       });
-      data = await res.json();
+      data = await safeJsonParse(res, llmConfig);
       if (data.error) {
         const friendly = formatApiError(data.error, llmConfig.provider, res.status);
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
@@ -2827,7 +2937,7 @@ async function callLlm(llmConfig, systemPrompt, userMessage) {
         body: JSON.stringify({ model: llmConfig.model, max_tokens: 16384, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }] }),
         signal: AbortSignal.timeout(180_000),
       });
-      data = await res.json();
+      data = await safeJsonParse(res, llmConfig);
       if (data.error) {
         const friendly = formatApiError(data.error, llmConfig.provider, res.status);
         return { error: friendly?.text || data.error.message || JSON.stringify(data.error), hint: friendly?.hint, duration: Date.now() - start };
@@ -2919,7 +3029,23 @@ function enrichFindings(report, files, pkgInfo) {
     report.max_severity = report.findings.length > 0 ? maxSev : 'none';
   }
 
+  const VALID_SEVERITIES = new Set(['critical', 'high', 'medium', 'low', 'info']);
+
   for (const finding of report.findings) {
+    // 0. Validate & sanitize finding fields
+    // Severity: must be one of the known values
+    const sev = (finding.severity || '').toLowerCase();
+    finding.severity = VALID_SEVERITIES.has(sev) ? sev : 'medium';
+    // Line number: must be a positive integer
+    if (finding.line != null) {
+      const lineNum = parseInt(finding.line, 10);
+      finding.line = (Number.isFinite(lineNum) && lineNum > 0) ? lineNum : undefined;
+    }
+    // File path: reject suspicious characters (null bytes, .., protocol schemes)
+    if (finding.file && (/[\x00]|\.\.[\\/]|^[a-z]+:\/\//i.test(finding.file))) {
+      finding.file = undefined;
+    }
+
     // 1. Fill cwe_id from pattern_id lookup
     if (!finding.cwe_id || finding.cwe_id === '') {
       const prefix = (finding.pattern_id || '').replace(/_\d+$/, '');
@@ -2988,6 +3114,9 @@ function enrichFindings(report, files, pkgInfo) {
 // ── SARIF 2.1.0 output ────────────────────────────────
 
 function toSarif(reports) {
+  if (!reports || (Array.isArray(reports) && reports.length === 0)) {
+    reports = [];
+  }
   const version = getVersion();
   const LEVEL_MAP = { critical: 'error', high: 'error', medium: 'warning', low: 'note', info: 'note' };
   const SCORE_MAP = { critical: '9.5', high: '8.0', medium: '5.5', low: '2.0', info: '0.5' };
@@ -2995,7 +3124,7 @@ function toSarif(reports) {
   const results = [];
   const ruleIndex = new Map();
 
-  for (const report of (Array.isArray(reports) ? reports : [reports])) {
+  for (const report of (Array.isArray(reports) ? reports : [reports]).filter(Boolean)) {
     for (const f of (report.findings || [])) {
       const ruleId = f.pattern_id || f.id || 'UNKNOWN';
       const sev = (f.severity || 'medium').toLowerCase();
@@ -3057,6 +3186,12 @@ function toSarif(reports) {
           .update(`${ruleId}:${filePath}:${lineNum}`)
           .digest('hex').slice(0, 16);
         result.partialFingerprints = { primaryLocationLineHash: hash };
+      } else {
+        // Fallback fingerprint from rule + title for findings without file/line
+        const hash = crypto.createHash('sha256')
+          .update(`${ruleId}:${f.title || ''}`)
+          .digest('hex').slice(0, 16);
+        result.partialFingerprints = { primaryLocationLineHash: hash };
       }
 
       results.push(result);
@@ -3080,7 +3215,191 @@ function toSarif(reports) {
   };
 }
 
+// ── Verification Pass (Pass 2) ──────────────────────────
+// Adversarial verification: re-examines each finding against actual source code
+
+function buildVerificationMessage(finding, context) {
+  return [
+    `## Finding to Verify`,
+    ``,
+    `**Title:** ${finding.title}`,
+    `**Severity:** ${finding.severity}`,
+    `**Confidence:** ${finding.confidence || 'medium'}`,
+    `**Pattern:** ${finding.pattern_id || 'unknown'} (${finding.cwe_id || 'N/A'})`,
+    `**File:** ${finding.file || 'unknown'}${finding.line ? ':' + finding.line : ''}`,
+    `**Description:** ${finding.description || ''}`,
+    `**Cited Code:**`,
+    '```',
+    finding.content || '(no code cited)',
+    '```',
+    ``,
+    `## Actual Source Code of ${finding.file || 'unknown'}`,
+    ``,
+    '```',
+    context.sourceFileContent,
+    '```',
+    ``,
+    `## Package File Listing (for context)`,
+    ``,
+    context.fileList,
+    ``,
+    `## Package Manifest`,
+    ``,
+    '```',
+    context.manifestContent,
+    '```',
+    ``,
+    `---`,
+    `Verify this finding. Does the cited code exist? Is the vulnerability real?`,
+    `Respond with ONLY the JSON verdict.`,
+  ].join('\n');
+}
+
+function downgradeSeverity(severity) {
+  const map = { critical: 'high', high: 'medium', medium: 'low', low: 'low', info: 'info' };
+  return map[(severity || '').toLowerCase()] || severity;
+}
+
+async function verifyFindings(findings, files, verifierConfig, options = {}) {
+  const { maxFindings = 10 } = options;
+
+  if (!findings || findings.length === 0) return { finalFindings: [], stats: { total: 0, verified: 0, demoted: 0, rejected: 0, unverified: 0, inputTokens: 0, outputTokens: 0 } };
+
+  const verificationPrompt = loadVerificationPrompt();
+  if (!verificationPrompt) return { finalFindings: findings, stats: { total: findings.length, verified: 0, demoted: 0, rejected: 0, unverified: findings.length, inputTokens: 0, outputTokens: 0 } };
+
+  // Sort by severity (critical first) and take top N
+  const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const toVerify = [...findings]
+    .sort((a, b) => (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4))
+    .slice(0, maxFindings);
+
+  const fileList = files.map(f => `${f.path} (${(f.content || '').length} bytes)`).join('\n');
+  const manifest = files.find(f =>
+    f.path === 'package.json' || f.path === 'pyproject.toml' ||
+    f.path === 'setup.py' || f.path === 'Cargo.toml'
+  );
+
+  const verified = [];
+  const demoted = [];
+  const rejected = [];
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
+  for (const finding of toVerify) {
+    // Find the actual source file
+    const sourceFile = files.find(f =>
+      f.path === finding.file || f.path.endsWith('/' + finding.file)
+    );
+
+    const userMsg = buildVerificationMessage(finding, {
+      sourceFileContent: sourceFile?.content || '(FILE NOT FOUND IN PACKAGE — this may indicate a fabricated file reference)',
+      fileList,
+      manifestContent: manifest?.content || '(no manifest found)',
+    });
+
+    try {
+      const result = await callLlm(verifierConfig, verificationPrompt, userMsg);
+
+      if (result.error) {
+        finding.verification_status = 'unverified';
+        finding.verification_reasoning = `Verification error: ${result.error}`;
+        continue;
+      }
+
+      const verdict = extractJSON(result.text);
+      totalInputTokens += result.inputTokens || 0;
+      totalOutputTokens += result.outputTokens || 0;
+
+      if (!verdict || !verdict.verification_status) {
+        finding.verification_status = 'unverified';
+        finding.verification_reasoning = 'Verification returned unparseable response';
+        continue;
+      }
+
+      // Apply verdict
+      finding.verification_model = verifierConfig.model;
+
+      switch (verdict.verification_status) {
+        case 'rejected':
+          finding.verification_status = 'rejected';
+          finding.verification_reasoning = verdict.rejection_reason || verdict.reasoning || 'Rejected by verification';
+          finding.code_exists = verdict.code_exists;
+          rejected.push(finding);
+          break;
+
+        case 'demoted':
+          finding.verification_status = 'demoted';
+          finding.original_severity = finding.severity;
+          finding.severity = verdict.verified_severity || downgradeSeverity(finding.severity);
+          finding.verified_confidence = verdict.verified_confidence || 'low';
+          finding.verification_reasoning = verdict.reasoning || '';
+          finding.is_opt_in = verdict.is_opt_in;
+          finding.code_exists = verdict.code_exists;
+          finding.by_design = verdict.is_opt_in || verdict.is_core_functionality || finding.by_design;
+          finding.score_impact = finding.by_design ? 0 : (SEVERITY_IMPACT[finding.severity] || -5);
+          demoted.push(finding);
+          break;
+
+        case 'verified':
+        default:
+          finding.verification_status = 'verified';
+          finding.verified_confidence = verdict.verified_confidence || finding.confidence;
+          finding.verification_reasoning = verdict.reasoning || '';
+          finding.code_exists = verdict.code_exists ?? true;
+          // Adjust severity if verifier disagrees
+          if (verdict.verified_severity && verdict.verified_severity !== finding.severity) {
+            finding.original_severity = finding.severity;
+            finding.severity = verdict.verified_severity;
+            finding.score_impact = finding.by_design ? 0 : (SEVERITY_IMPACT[finding.severity] || -5);
+          }
+          verified.push(finding);
+          break;
+      }
+    } catch (err) {
+      finding.verification_status = 'unverified';
+      finding.verification_reasoning = `Verification error: ${err.message || err}`;
+    }
+  }
+
+  // Findings not sent to verification remain as-is
+  const unverified = findings.filter(f => !toVerify.includes(f));
+  for (const f of unverified) {
+    if (!f.verification_status) f.verification_status = 'unverified';
+  }
+
+  // Final findings = verified + demoted + unverified (rejected are REMOVED)
+  const finalFindings = [...verified, ...demoted, ...unverified];
+
+  return {
+    verified,
+    demoted,
+    rejected,
+    unverified,
+    finalFindings,
+    stats: {
+      total: findings.length,
+      verified: verified.length,
+      demoted: demoted.length,
+      rejected: rejected.length,
+      unverified: unverified.length,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+    },
+  };
+}
+
 async function auditRepo(url) {
+  // In quiet mode (SARIF/JSON), redirect all progress output to stderr
+  // so stdout only contains clean machine-readable data
+  const _origConsoleLog = console.log;
+  const _origStdoutWrite = process.stdout.write;
+  if (quietMode) {
+    console.log = console.error;
+    process.stdout.write = process.stderr.write.bind(process.stderr);
+  }
+  try {
   const start = Date.now();
 
   // Support local directories
@@ -3378,15 +3697,52 @@ async function auditRepo(url) {
   }
 
   if (!activeLlm) {
+    // Check if user is logged in — offer remote scan as fallback
+    const _creds = loadCredentials();
+    if (_creds && process.stdin.isTTY && !process.argv.includes('--export')) {
+      console.log();
+      console.log(`  ${c.yellow}No LLM API key configured.${c.reset}`);
+      console.log();
+      // Fetch quota for display
+      let quotaLabel = '3/day free';
+      try {
+        const qr = await fetch(`${REGISTRY_URL}/api/scan`, {
+          headers: { 'Authorization': `Bearer ${_creds.api_key}` },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (qr.ok) {
+          const q = await qr.json();
+          quotaLabel = `${q.remaining}/${q.limit} free remaining`;
+        }
+      } catch {}
+      console.log(`  ${c.cyan}1${c.reset}  Use agentaudit.dev ${c.dim}(${quotaLabel})${c.reset}`);
+      console.log(`  ${c.cyan}2${c.reset}  Configure local LLM ${c.dim}(agentaudit model)${c.reset}`);
+      console.log();
+      const _choice = await askQuestion(`  Choice ${c.dim}(1/2, default: 1):${c.reset} `);
+      console.log();
+      if (_choice.trim() === '2') {
+        console.log(`  ${c.dim}Run ${c.cyan}agentaudit model${c.dim} to configure your LLM provider and API key.${c.reset}`);
+        console.log();
+        return null;
+      }
+      // Default: remote audit
+      return await remoteAudit(url);
+    }
+
+    // Not logged in or non-interactive
     console.log();
-    console.log(`  ${c.yellow}No LLM API key found.${c.reset} The ${c.bold}audit${c.reset} command needs an LLM to analyze code.`);
-    console.log();
-    console.log(`  ${c.bold}Set an API key${c.reset} (e.g. ${c.cyan}export OPENROUTER_API_KEY=sk-or-...${c.reset})`);
-    console.log(`  ${c.dim}Run "agentaudit model" to configure provider + model interactively${c.reset}`);
-    console.log();
-    console.log(`  ${c.bold}Or export for manual review:${c.reset} ${c.cyan}agentaudit audit ${url} --export${c.reset}`);
-    console.log(`  ${c.bold}Or use as MCP server${c.reset} in Cursor/Claude ${c.dim}(no extra API key needed)${c.reset}`);
-    console.log(`  ${c.dim}{ "agentaudit": { "command": "npx", "args": ["-y", "agentaudit"] } }${c.reset}`);
+    if (!_creds) {
+      console.log(`  ${c.yellow}No LLM API key found.${c.reset} To run a deep audit, you need either:`);
+      console.log();
+      console.log(`  ${c.bold}1.${c.reset} An LLM API key:  ${c.cyan}agentaudit model${c.reset}`);
+      console.log(`  ${c.bold}2.${c.reset} A free account:   ${c.cyan}agentaudit login${c.reset}  ${c.dim}(3 free remote scans/day)${c.reset}`);
+    } else {
+      console.log(`  ${c.yellow}No LLM API key found.${c.reset} The ${c.bold}audit${c.reset} command needs an LLM to analyze code.`);
+      console.log();
+      console.log(`  ${c.bold}Set an API key${c.reset} (e.g. ${c.cyan}export OPENROUTER_API_KEY=sk-or-...${c.reset})`);
+      console.log(`  ${c.dim}Run "agentaudit model" to configure provider + model interactively${c.reset}`);
+      console.log(`  ${c.dim}Or use ${c.cyan}agentaudit audit ${url} --remote${c.dim} for a free server-side scan${c.reset}`);
+    }
     console.log();
     if (process.argv.includes('--export')) {
       const exportPath = path.join(process.cwd(), `audit-${slug}.md`);
@@ -3440,6 +3796,91 @@ async function auditRepo(url) {
 
   enrichReport(report);
   enrichFindings(report, files, pkgInfo);
+
+  // ── Pass 2: Verification ──────────────────────────────
+  const verifyArg = process.argv.find(a => a === '--verify' || a.startsWith('--verify='));
+  const noVerify = process.argv.includes('--no-verify');
+
+  let verificationResult = null;
+  if (verifyArg && !noVerify && report.findings && report.findings.length > 0) {
+    // Resolve verifier model
+    let verifierConfig;
+    const verifyValue = verifyArg.includes('=') ? verifyArg.split('=')[1] : process.argv[process.argv.indexOf('--verify') + 1];
+
+    if (verifyValue === 'cross') {
+      // Cross-model: pick a different model than the scanner
+      const crossModels = ['sonnet', 'haiku', 'gemini', 'gpt-4o'];
+      const scannerName = (activeLlm.name || '').toLowerCase();
+      const crossModel = crossModels.find(m => !scannerName.includes(m)) || crossModels[0];
+      verifierConfig = resolveModel(crossModel);
+    } else if (verifyValue === 'self' || verifyValue === '--' || !verifyValue || verifyValue.startsWith('-')) {
+      // Self-verification: same model
+      verifierConfig = activeLlm;
+    } else {
+      // Specific model name
+      verifierConfig = resolveModel(verifyValue);
+    }
+
+    if (!verifierConfig) {
+      console.log(`  ${c.yellow}⚠ Verification skipped: no API key for verifier model${c.reset}`);
+    } else {
+      const verifyMode = verifierConfig === activeLlm ? 'self' : 'cross';
+      const verifyLabel = `${verifierConfig.name} → ${verifierConfig.model}`;
+      console.log();
+      process.stdout.write(`  ${stepProgress(5, 5)} Verifying findings ${c.dim}(${verifyMode}, ${verifyLabel})${c.reset}...`);
+
+      const vStart = Date.now();
+      verificationResult = await verifyFindings(report.findings, files, verifierConfig, { maxFindings: 10 });
+      const vDuration = Math.round((Date.now() - vStart) / 1000);
+
+      console.log(` ${c.green}done${c.reset} ${c.dim}(${vDuration}s)${c.reset}`);
+
+      // Show per-finding verification results
+      for (const f of verificationResult.rejected) {
+        console.log(`    ${c.red}✗${c.reset} ${(f.title || '').slice(0, 50).padEnd(52)} ${c.red}rejected${c.reset} ${c.dim}(${f.verification_reasoning?.slice(0, 60) || ''})${c.reset}`);
+      }
+      for (const f of verificationResult.demoted) {
+        console.log(`    ${c.yellow}↓${c.reset} ${(f.title || '').slice(0, 50).padEnd(52)} ${c.yellow}demoted${c.reset} ${c.dim}(${f.original_severity} → ${f.severity})${c.reset}`);
+      }
+      for (const f of verificationResult.verified) {
+        console.log(`    ${c.green}✓${c.reset} ${(f.title || '').slice(0, 50).padEnd(52)} ${c.green}verified${c.reset} ${c.dim}(${f.verified_confidence || f.confidence || 'medium'})${c.reset}`);
+      }
+
+      console.log(`    ${c.dim}${verificationResult.stats.verified} verified, ${verificationResult.stats.demoted} demoted, ${verificationResult.stats.rejected} rejected${c.reset}`);
+
+      // Apply: replace findings with verified set (rejected are removed)
+      const findingsBeforeVerification = report.findings.length;
+      report.findings = verificationResult.finalFindings;
+      report.findings_count = report.findings.length;
+
+      // Recalculate risk score after verification
+      const recalcRisk = report.findings.reduce((sum, f) => {
+        if (f.by_design) return sum;
+        return sum + Math.abs(f.score_impact || SEVERITY_IMPACT[f.severity] || -5);
+      }, 0);
+      report.risk_score = Math.min(100, recalcRisk);
+      report.max_severity = report.findings.length > 0
+        ? report.findings.reduce((max, f) => {
+            const order = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+            return (order[f.severity] || 0) > (order[max] || 0) ? f.severity : max;
+          }, 'info')
+        : 'none';
+      if (report.risk_score <= 25) report.result = 'safe';
+      else if (report.risk_score <= 50) report.result = 'caution';
+      else report.result = 'unsafe';
+
+      // Add verification metadata to report
+      report.verification_pass = true;
+      report.verification_model = verifierConfig.model;
+      report.verification_mode = verifyMode;
+      report.verification_duration_ms = Date.now() - vStart;
+      report.findings_before_verification = findingsBeforeVerification;
+      report.findings_rejected = verificationResult.stats.rejected;
+      report.findings_demoted = verificationResult.stats.demoted;
+      report.findings_verified = verificationResult.stats.verified;
+    }
+  }
+
   saveHistory(report);
 
   // Display results
@@ -3449,11 +3890,15 @@ async function auditRepo(url) {
   console.log();
 
   if (report.findings && report.findings.length > 0) {
-    console.log(sectionHeader(`Findings (${report.findings.length})`));
+    const rejectedNote = verificationResult ? ` ${c.dim}[${verificationResult.stats.rejected} rejected by verification]${c.reset}` : '';
+    console.log(sectionHeader(`Findings (${report.findings.length})`) + rejectedNote);
     console.log();
     for (const f of report.findings) {
       const sc = severityColor(f.severity);
-      console.log(`  ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}`);
+      let badge = '';
+      if (f.verification_status === 'verified') badge = ` ${c.green}✓${c.reset}`;
+      else if (f.verification_status === 'demoted') badge = ` ${c.yellow}↓${c.reset}${c.dim}was ${f.original_severity}${c.reset}`;
+      console.log(`  ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}${badge}`);
       if (f.file) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.file}${f.line ? ':' + f.line : ''}${c.reset}`);
       if (f.description) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.description.slice(0, 120)}${c.reset}`);
       console.log();
@@ -3504,6 +3949,222 @@ async function auditRepo(url) {
 
   console.log();
   return report;
+
+  } finally {
+    console.log = _origConsoleLog;
+    process.stdout.write = _origStdoutWrite;
+  }
+}
+
+// ── Remote Audit (server-side free scan via SSE) ────────
+
+async function remoteAudit(url) {
+  // 1. Check credentials
+  const creds = loadCredentials();
+  if (!creds) {
+    console.log();
+    console.log(`  ${c.red}Not logged in.${c.reset} Remote scans require an agentaudit.dev account.`);
+    console.log(`  ${c.dim}Run ${c.cyan}agentaudit login${c.dim} to sign in (free).${c.reset}`);
+    console.log();
+    return null;
+  }
+
+  const authHeaders = { 'Authorization': `Bearer ${creds.api_key}`, 'Content-Type': 'application/json' };
+
+  // 2. Check quota
+  if (!quietMode) {
+    try {
+      const quotaRes = await fetch(`${REGISTRY_URL}/api/scan`, {
+        headers: authHeaders,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (quotaRes.ok) {
+        const quota = await quotaRes.json();
+        if (quota.remaining <= 0) {
+          console.log();
+          console.log(`  ${c.red}Rate limit reached${c.reset} — 0 of ${quota.limit} free remote scans remaining.`);
+          console.log(`  ${c.dim}Configure a local LLM for unlimited scans: ${c.cyan}agentaudit model${c.reset}`);
+          console.log();
+          return null;
+        }
+        console.log(`  ${c.dim}Remote scans: ${quota.remaining} of ${quota.limit} remaining today${c.reset}`);
+      }
+    } catch {
+      // Quota check failed — continue, the POST will catch it
+    }
+  }
+
+  // 3. Start SSE stream
+  if (!quietMode) {
+    console.log();
+    console.log(sectionHeader('Remote Audit'));
+    console.log(`  ${c.dim}Server: ${REGISTRY_URL}  •  Model: Gemini 2.5 Flash${c.reset}`);
+    console.log();
+  }
+
+  const startTime = Date.now();
+  let report = null;
+
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/scan`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(90_000),
+    });
+
+    if (!res.ok) {
+      let errBody;
+      try { errBody = await res.json(); } catch { errBody = { error: `HTTP ${res.status}` }; }
+      console.log(`  ${c.red}${errBody.message || errBody.error || `Server error (${res.status})`}${c.reset}`);
+      console.log();
+      return null;
+    }
+
+    // 4. Parse SSE stream
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const findings = [];
+    let currentStep = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop(); // keep incomplete chunk
+
+      for (const part of parts) {
+        const eventMatch = part.match(/^event:\s*(.+)/m);
+        if (!eventMatch) continue;
+        // Accumulate all data: lines per SSE spec (data fields can span multiple lines)
+        const dataLines = [];
+        for (const line of part.split('\n')) {
+          const dm = line.match(/^data:\s?(.*)/);
+          if (dm) dataLines.push(dm[1]);
+        }
+        if (dataLines.length === 0) continue;
+        const dataStr = dataLines.join('\n');
+
+        const event = eventMatch[1].trim();
+        let data;
+        try { data = JSON.parse(dataStr); } catch { continue; }
+
+        switch (event) {
+          case 'step': {
+            if (quietMode) break;
+            const icon = data.status === 'done' ? `${c.green}✔${c.reset}` : `${c.cyan}◌${c.reset}`;
+            const detail = data.detail ? ` ${c.dim}(${data.detail})${c.reset}` : '';
+            // Clear previous line if updating same step
+            if (currentStep && data.status === 'done') {
+              process.stdout.write(`\r\x1b[K`);
+            }
+            if (data.status === 'done') {
+              console.log(`  ${icon} ${data.label}${detail}`);
+              currentStep = '';
+            } else {
+              process.stdout.write(`\r  ${icon} ${data.label}${detail}`);
+              currentStep = data.label;
+            }
+            break;
+          }
+
+          case 'finding': {
+            findings.push(data);
+            break;
+          }
+
+          case 'cached': {
+            if (!quietMode) {
+              console.log(`  ${c.cyan}ℹ${c.reset} Using cached result from ${c.bold}${data.scanned_ago}${c.reset}`);
+            }
+            break;
+          }
+
+          case 'result': {
+            report = {
+              cached: data.cached,
+              result: data.result,
+              risk_score: data.risk_score,
+              trust_score: data.trust_score,
+              findings_count: data.findings_count,
+              max_severity: data.max_severity,
+              slug: data.slug,
+              url: data.url,
+              findings: findings,
+              audit_model: 'google/gemini-2.5-flash',
+              audit_provider: 'agentaudit.dev',
+              source_url: url,
+              skill_slug: data.slug,
+              audit_duration_ms: Date.now() - startTime,
+            };
+            break;
+          }
+
+          case 'error': {
+            if (currentStep) {
+              process.stdout.write(`\r\x1b[K`);
+              currentStep = '';
+            }
+            console.log(`  ${c.red}${data.message || 'Server error'}${c.reset}`);
+            break;
+          }
+
+          case 'done':
+            break;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.log(`  ${c.red}Timeout — server took too long to respond.${c.reset}`);
+    } else {
+      console.log(`  ${c.red}Connection error: ${err.message}${c.reset}`);
+    }
+    console.log();
+    return null;
+  }
+
+  if (!report) {
+    console.log(`  ${c.red}No result received from server.${c.reset}`);
+    console.log();
+    return null;
+  }
+
+  // 5. Display results
+  if (!quietMode) {
+    console.log();
+    console.log(sectionHeader('Result'));
+    console.log(`  ${riskBadge(report.risk_score || 0)}`);
+    console.log();
+
+    if (findings.length > 0) {
+      console.log(sectionHeader(`Findings (${findings.length})`));
+      console.log();
+      for (const f of findings) {
+        const sc = severityColor(f.severity);
+        console.log(`  ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}`);
+        if (f.file) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.file}${f.line ? ':' + f.line : ''}${c.reset}`);
+        console.log();
+      }
+    } else {
+      console.log(`  ${c.green}No findings — package looks clean.${c.reset}`);
+      console.log();
+    }
+
+    console.log(`  ${c.dim}Report: ${REGISTRY_URL}/packages/${report.slug}${c.reset}`);
+    console.log(`  ${c.dim}Duration: ${elapsed(startTime)}${c.reset}`);
+    console.log();
+  }
+
+  // JSON output
+  if (jsonMode && !quietMode) {
+    console.log(JSON.stringify(report, null, 2));
+  }
+
+  return report;
 }
 
 // ── Check command ───────────────────────────────────────
@@ -3519,6 +4180,7 @@ async function checkPackage(name) {
     if (!jsonMode) {
       console.log(`  ${c.yellow}Not found${c.reset} — package "${name}" hasn't been audited yet.`);
       console.log(`  ${c.dim}Run: agentaudit audit <repo-url> for a deep LLM audit${c.reset}`);
+      await suggestSimilarPackages(name);
     }
     return null;
   }
@@ -3586,7 +4248,10 @@ function renderOverviewTab(data, width) {
       const idx = leaderboard.findIndex(e => e.agent_name === creds.agent_name);
       if (idx >= 0) rank = `#${idx + 1} of ${leaderboard.length}`;
     }
-    profileLines.push(`${c.bold}${creds.agent_name}${c.reset}${' '.repeat(Math.max(1, halfW - 14 - visLen(creds.agent_name) - visLen(rank)))}${c.dim}${rank}${c.reset}`);
+    const nameVis = visLen(creds.agent_name);
+    const rankVis = visLen(rank);
+    const nameGap = Math.max(1, halfW - nameVis - rankVis);
+    profileLines.push(`${c.bold}${creds.agent_name}${c.reset}${' '.repeat(nameGap)}${c.dim}${rank}${c.reset}`);
     profileLines.push(`Points     ${c.bold}${fmtNum(agent.total_points)}${c.reset}`);
     profileLines.push(`Audits     ${c.bold}${fmtNum(agent.total_reports)}${c.reset}`);
     profileLines.push(`Findings   ${c.bold}${fmtNum(agent.total_findings_submitted)}${c.reset} ${c.dim}(${fmtNum(agent.total_findings_confirmed)} confirmed)${c.reset}`);
@@ -3621,6 +4286,15 @@ function renderOverviewTab(data, width) {
     regLines.push(`${c.dim}Could not load registry stats${c.reset}`);
   }
 
+  // Local history stats
+  const localHistory = loadHistory(50);
+  const verifiedCount = localHistory.filter(h => h.verification).length;
+  const localStats = {
+    total: localHistory.length,
+    verified: verifiedCount,
+    lastAudit: localHistory[0] ? timeAgo(localHistory[0].timestamp || localHistory[0].date) : null,
+  };
+
   const boxW = halfW + 4;
   const profileBox = drawBox('Your Profile', profileLines, boxW);
   const registryBox = drawBox('Registry', regLines, boxW);
@@ -3628,14 +4302,37 @@ function renderOverviewTab(data, width) {
   // Side by side if wide enough, stacked otherwise
   if (width >= boxW * 2 + 4) {
     const maxLen = Math.max(profileBox.length, registryBox.length);
-    while (profileBox.length < maxLen) profileBox.push(`  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
-    while (registryBox.length < maxLen) registryBox.push(`  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
+    // Insert filler lines BEFORE the bottom border (last line), not after
+    while (profileBox.length < maxLen) {
+      profileBox.splice(profileBox.length - 1, 0, `  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
+    }
+    while (registryBox.length < maxLen) {
+      registryBox.splice(registryBox.length - 1, 0, `  ${BOX.v} ${' '.repeat(halfW + 1)}${BOX.v}`);
+    }
     for (let i = 0; i < maxLen; i++) {
       lines.push(profileBox[i] + '  ' + registryBox[i].trimStart());
     }
   } else {
     lines.push(...profileBox, '', ...registryBox);
   }
+
+  // Local history section
+  lines.push('');
+  if (localStats.total > 0) {
+    const histParts = [`${c.bold}${localStats.total}${c.reset} local audits`];
+    if (localStats.verified > 0) histParts.push(`${c.green}${localStats.verified} verified${c.reset}`);
+    if (localStats.lastAudit) histParts.push(`${c.dim}last: ${localStats.lastAudit}${c.reset}`);
+    lines.push(`  ${c.dim}Local:${c.reset} ${histParts.join(`  ${c.dim}│${c.reset}  `)}`);
+  }
+
+  // Quick actions
+  lines.push('');
+  lines.push(`  ${c.bold}Quick Actions${c.reset}`);
+  lines.push(`  ${c.cyan}agentaudit audit <url>${c.reset}            ${c.dim}Deep LLM security audit${c.reset}`);
+  lines.push(`  ${c.cyan}agentaudit audit <url> --verify${c.reset}   ${c.dim}Audit + adversarial verification${c.reset}`);
+  lines.push(`  ${c.cyan}agentaudit audit <url> --remote${c.reset}   ${c.dim}Server-side scan (no API key)${c.reset}`);
+  lines.push(`  ${c.cyan}agentaudit consensus <pkg>${c.reset}        ${c.dim}Cross-model consensus view${c.reset}`);
+  lines.push(`  ${c.cyan}agentaudit search <query>${c.reset}         ${c.dim}Search the registry${c.reset}`);
 
   return lines;
 }
@@ -3658,7 +4355,7 @@ function renderLeaderboardTab(data, width, opts = {}) {
     const entry = leaderboard[i];
     const name = (entry.agent_name || '').slice(0, maxNameW);
     const isMe = creds && entry.agent_name === creds.agent_name;
-    const prefix = i < 3 ? ` ${medals[i]} ` : `  ${c.dim}#${String(i + 1).padStart(2)}${c.reset} `;
+    const prefix = i < 3 ? `  ${medals[i]}   ` : `  ${c.dim}#${String(i + 1).padStart(2)}${c.reset} `;
     const nameStr = isMe ? `${c.green}${c.bold}${name}${c.reset}` : name;
     const bar = renderBar(entry.total_points || 0, maxPts, barW);
     const pts = padLeft(`${fmtNum(entry.total_points || 0)} pts`, 12);
@@ -3959,6 +4656,31 @@ function renderSearchTab(searchState, width) {
   return lines;
 }
 
+async function suggestSimilarPackages(slug) {
+  if (jsonMode || quietMode) return;
+  try {
+    const res = await fetch(`${REGISTRY_URL}/api/lookup?hash=${encodeURIComponent(slug)}`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    // API returns { reports: [...], findings: [...], total_matches }
+    const reports = data.reports || [];
+    if (reports.length === 0) return;
+    console.log();
+    console.log(`  ${c.dim}Did you mean one of these?${c.reset}`);
+    const shown = reports.slice(0, 5);
+    for (const p of shown) {
+      const name = p.skill_slug || p.slug || '?';
+      const risk = p.risk_score ?? 0;
+      const badge = risk === 0 ? `${c.green}safe${c.reset}` : risk <= 25 ? `${c.green}score ${100 - risk}${c.reset}` : risk <= 50 ? `${c.yellow}score ${100 - risk}${c.reset}` : `${c.red}score ${100 - risk}${c.reset}`;
+      console.log(`    ${c.cyan}${name}${c.reset}  ${badge}`);
+    }
+    if (data.total_matches > 5) console.log(`    ${c.dim}...and ${data.total_matches - 5} more${c.reset}`);
+    console.log(`  ${c.dim}Use: ${c.cyan}agentaudit search <query>${c.dim} to find packages${c.reset}`);
+  } catch { /* ignore */ }
+}
+
 async function searchCommand(args) {
   const query = args.filter(a => !a.startsWith('--')).join(' ').trim();
 
@@ -4065,7 +4787,7 @@ async function leaderboardCommand(args) {
     const entry = data[i];
     const name = (entry.agent_name || '').slice(0, 20);
     const isMe = creds && entry.agent_name === creds.agent_name;
-    const prefix = i < 3 ? ` ${medals[i]} ` : `  #${String(i + 1).padStart(2)}  `;
+    const prefix = i < 3 ? `  ${medals[i]}   ` : `  ${c.dim}#${String(i + 1).padStart(2)}${c.reset} `;
     const nameStr = isMe ? `${c.green}${c.bold}${name}${c.reset}` : name;
     const bar = renderBar(entry.total_points || 0, maxPts, barW);
     const pts = `${fmtNum(entry.total_points || 0)} pts`;
@@ -4383,7 +5105,7 @@ async function main() {
   // --no-color already handled at top level for `c` object
 
   // Strip global flags from args (including --model <value>, --format <value>)
-  const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color', '--no-upload']);
+  const globalFlags = new Set(['--json', '--quiet', '-q', '--no-color', '--no-upload', '--remote']);
   let args = rawArgs.filter(a => !globalFlags.has(a));
   // Remove --model <value> and --models <value> pairs
   const modelIdx = args.indexOf('--model');
@@ -4395,9 +5117,18 @@ async function main() {
   const formatFlag = formatIdx !== -1 ? args.splice(formatIdx, 2)[1] : null;
   // --json is alias for --format json
   const outputFormat = formatFlag || (jsonMode ? 'json' : null);
+  // Validate --format value
+  if (outputFormat && !['json', 'sarif'].includes(outputFormat)) {
+    console.error(`  ${c.red}Unknown format: ${outputFormat}${c.reset}`);
+    console.error(`  ${c.dim}Supported formats: json, sarif${c.reset}`);
+    process.exitCode = 2; return;
+  }
   // SARIF mode: suppress console output so only clean JSON goes to stdout
   if (outputFormat === 'sarif') { quietMode = true; jsonMode = true; }
-  
+
+  // --remote: use server-side scan instead of local LLM
+  const remoteFlag = rawArgs.includes('--remote');
+
   // Detect per-command --help BEFORE stripping (e.g. `agentaudit model --help`)
   const wantsHelp = args.includes('--help') || args.includes('-h');
   // Strip --help/-h from args for routing
@@ -4434,20 +5165,28 @@ async function main() {
       ``,
       `${c.bold}Options:${c.reset}`,
       `  --deep             Run deep LLM audit instead (same as \`agentaudit audit\`)`,
+      `  --remote           Use agentaudit.dev server for --deep (no LLM key needed)`,
       `  --format sarif      Output results as SARIF 2.1.0 (for GitHub Code Scanning)`,
       ``,
       `${c.bold}Examples:${c.reset}`,
       `  agentaudit scan https://github.com/owner/repo`,
       `  agentaudit scan https://github.com/a/b https://github.com/c/d`,
       `  agentaudit scan https://github.com/owner/repo --deep`,
+      `  agentaudit scan https://github.com/owner/repo --deep --remote`,
       `  agentaudit scan https://github.com/owner/repo --format sarif > results.sarif`,
     ],
     audit: [
       `${c.bold}agentaudit audit${c.reset} <url> [url...] [options]`,
       ``,
-      `Deep LLM-powered 3-pass security audit (~30s). Requires an LLM API key.`,
+      `Deep LLM-powered security audit with optional verification pass.`,
       ``,
       `${c.bold}Options:${c.reset}`,
+      `  --verify [mode]    Enable Pass 2 verification (reduces false positives)`,
+      `                       self   — same model verifies its own findings (default)`,
+      `                       cross  — different model verifies (higher quality)`,
+      `                       <name> — specific model as verifier (e.g. sonnet)`,
+      `  --no-verify        Disable verification (even if default)`,
+      `  --remote           Use agentaudit.dev server (no LLM key needed, 3/day free)`,
       `  --model <name>     Override LLM model for this run`,
       `  --models <a,b,c>   Multi-model audit (parallel calls, consensus comparison)`,
       `  --no-upload        Skip uploading report to registry`,
@@ -4457,6 +5196,9 @@ async function main() {
       ``,
       `${c.bold}Examples:${c.reset}`,
       `  agentaudit audit https://github.com/owner/repo`,
+      `  agentaudit audit https://github.com/owner/repo --verify`,
+      `  agentaudit audit https://github.com/owner/repo --verify cross`,
+      `  agentaudit audit https://github.com/owner/repo --remote`,
       `  agentaudit audit https://github.com/owner/repo --model gpt-4o`,
       `  agentaudit audit https://github.com/owner/repo --models gemini-2.5-flash,claude-sonnet-4-20250514`,
       `  agentaudit audit https://github.com/owner/repo --format sarif > results.sarif`,
@@ -4587,13 +5329,23 @@ async function main() {
       `  agentaudit consensus fastmcp --json`,
     ],
     history: [
-      `${c.bold}agentaudit history${c.reset} [options]`,
+      `${c.bold}agentaudit history${c.reset} [show|upload] [n]`,
       ``,
       `Show your local audit history. Results are stored in ~/.config/agentaudit/history/`,
       `after every audit run. No internet connection required.`,
       ``,
+      `${c.bold}Subcommands:${c.reset}`,
+      `  history              List all local audits (numbered)`,
+      `  history show <n>     Show full report details for entry #n`,
+      `  history upload <n>   Retry upload of entry #n to agentaudit.dev`,
+      ``,
       `${c.bold}Options:${c.reset}`,
       `  --json          Machine-readable JSON output`,
+      ``,
+      `${c.bold}Examples:${c.reset}`,
+      `  agentaudit history`,
+      `  agentaudit history show 1`,
+      `  agentaudit history upload 1`,
     ],
     activity: [
       `${c.bold}agentaudit activity${c.reset} [options]`,
@@ -4717,6 +5469,7 @@ async function main() {
     console.log(`    ${c.dim}--json             Machine-readable JSON output${c.reset}`);
     console.log(`    ${c.dim}--quiet            Suppress banner${c.reset}`);
     console.log(`    ${c.dim}--no-color         Disable ANSI colors (also: NO_COLOR env)${c.reset}`);
+    console.log(`    ${c.dim}--verify [mode]    Verify findings (reduces false positives)${c.reset}`);
     console.log(`    ${c.dim}--model <name>     Override LLM model for this run${c.reset}`);
     console.log(`    ${c.dim}--models <a,b,c>   Multi-model audit (parallel, with consensus)${c.reset}`);
     console.log(`    ${c.dim}--no-upload        Skip uploading report to registry${c.reset}`);
@@ -4756,13 +5509,96 @@ async function main() {
   }
   if (command === 'history') {
     banner();
+    const subCmd = targets[0];
     const entries = loadHistory(30);
-    if (entries.length === 0) {
+
+    if (entries.length === 0 && !subCmd) {
       console.log(`  ${c.dim}No local audit history yet. Run ${c.cyan}agentaudit audit <url>${c.dim} to start.${c.reset}`);
       console.log();
       return;
     }
 
+    // history show <n> — show full report details
+    if (subCmd === 'show') {
+      const idx = parseInt(targets[1], 10) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= entries.length) {
+        console.log(`  ${c.red}Invalid index.${c.reset} Use a number from 1 to ${entries.length}.`);
+        console.log(`  ${c.dim}Run ${c.cyan}agentaudit history${c.dim} to see the list.${c.reset}`);
+        return;
+      }
+      const entry = entries[idx];
+      if (jsonMode) {
+        console.log(JSON.stringify(entry, null, 2));
+        return;
+      }
+      console.log(sectionHeader(`Report: ${entry.skill_slug || 'unknown'}`));
+      console.log();
+      console.log(`  Source      ${c.bold}${entry.source_url || '?'}${c.reset}`);
+      console.log(`  Model       ${c.bold}${entry.audit_model || '?'}${c.reset}  ${c.dim}(${entry.audit_provider || '?'})${c.reset}`);
+      console.log(`  Risk        ${riskBadge(entry.risk_score ?? 0)}`);
+      console.log(`  Result      ${entry.result || '?'}`);
+      console.log(`  Files       ${entry.files_scanned || '?'}  ${c.dim}Duration: ${entry.audit_duration_ms ? (entry.audit_duration_ms / 1000).toFixed(1) + 's' : '?'}${c.reset}`);
+      console.log(`  Tokens      ${c.dim}in: ${entry.input_tokens || '?'}  out: ${entry.output_tokens || '?'}${c.reset}`);
+      console.log(`  File        ${c.dim}${entry._file}${c.reset}`);
+      console.log();
+      if (entry.findings && entry.findings.length > 0) {
+        console.log(sectionHeader(`Findings (${entry.findings.length})`));
+        console.log();
+        for (const f of entry.findings) {
+          const sc = severityColor(f.severity);
+          console.log(`  ${sc}┃${c.reset} ${sc}${(f.severity || '').toUpperCase().padEnd(8)}${c.reset}  ${c.bold}${f.title}${c.reset}`);
+          if (f.file) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.file}${f.line ? ':' + f.line : ''}${c.reset}`);
+          if (f.description) console.log(`  ${sc}┃${c.reset}           ${c.dim}${f.description.slice(0, 200)}${c.reset}`);
+          console.log();
+        }
+      } else {
+        console.log(`  ${c.green}No findings.${c.reset}`);
+        console.log();
+      }
+      return;
+    }
+
+    // history upload <n> — retry upload of a local report
+    if (subCmd === 'upload') {
+      const idx = parseInt(targets[1], 10) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= entries.length) {
+        console.log(`  ${c.red}Invalid index.${c.reset} Use a number from 1 to ${entries.length}.`);
+        console.log(`  ${c.dim}Run ${c.cyan}agentaudit history${c.dim} to see the list.${c.reset}`);
+        return;
+      }
+      const entry = entries[idx];
+      const creds = loadCredentials();
+      if (!creds) {
+        console.log(`  ${c.red}Not logged in.${c.reset} Run ${c.cyan}agentaudit login${c.reset} first.`);
+        return;
+      }
+      process.stdout.write(`  Uploading ${c.bold}${entry.skill_slug}${c.reset} (${entry.audit_model || '?'})...`);
+      try {
+        const reportCopy = { ...entry };
+        delete reportCopy._file;
+        const res = await fetch(`${REGISTRY_URL}/api/reports`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${creds.api_key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(reportCopy),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          console.log(` ${c.green}done${c.reset} ${c.dim}(report #${data.report_id})${c.reset}`);
+          console.log(`  ${c.dim}${REGISTRY_URL}/packages/${entry.skill_slug}${c.reset}`);
+        } else {
+          const errBody = await res.text().catch(() => '');
+          console.log(` ${c.red}failed (HTTP ${res.status})${c.reset}`);
+          if (errBody) console.log(`  ${c.dim}${errBody.slice(0, 300)}${c.reset}`);
+        }
+      } catch (e) {
+        console.log(` ${c.red}failed: ${e.message}${c.reset}`);
+      }
+      console.log();
+      return;
+    }
+
+    // Default: list all entries
     if (jsonMode) {
       console.log(JSON.stringify(entries, null, 2));
       return;
@@ -4771,7 +5607,8 @@ async function main() {
     console.log(sectionHeader(`Local History (${entries.length})`));
     console.log();
 
-    for (const entry of entries) {
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
       const slug = entry.skill_slug || 'unknown';
       const risk = entry.risk_score ?? '?';
       const sev = entry.max_severity || 'none';
@@ -4779,10 +5616,13 @@ async function main() {
       const model = entry.audit_model || '?';
       const fc = entry.findings?.length || 0;
       const ts = entry._file?.slice(0, 10) || '';
-      console.log(`  ${sc}┃${c.reset} ${c.bold}${slug.padEnd(30)}${c.reset} ${riskBadge(risk)}  ${c.dim}${model}${c.reset}`);
-      console.log(`  ${sc}┃${c.reset} ${c.dim}${ts}  ${fc} findings  ${sev.toUpperCase()}${c.reset}`);
+      const num = `${c.dim}${String(i + 1).padStart(2)}.${c.reset}`;
+      console.log(`  ${num} ${sc}┃${c.reset} ${c.bold}${slug.padEnd(30)}${c.reset} ${riskBadge(risk)}  ${c.dim}${model}${c.reset}`);
+      console.log(`     ${sc}┃${c.reset} ${c.dim}${ts}  ${fc} findings  ${sev.toUpperCase()}${c.reset}`);
       console.log();
     }
+    console.log(`  ${c.dim}Tip: ${c.cyan}agentaudit history show <n>${c.dim} for details, ${c.cyan}history upload <n>${c.dim} to retry upload${c.reset}`);
+    console.log();
     return;
   }
   if (command === 'activity' || command === 'my') {
@@ -4813,9 +5653,22 @@ async function main() {
         } else {
           console.log(`  ${c.red}API error (HTTP ${res.status})${c.reset}`);
         }
+        // Suggest similar packages via search
+        await suggestSimilarPackages(slug);
         return;
       }
       const data = await res.json();
+
+      // Check if package actually has any reports
+      if ((!data.total_reports && data.total_reports !== undefined) || (data.total_reports === 0 && (!data.findings || data.findings.length === 0))) {
+        if (jsonMode) { console.log(JSON.stringify(data, null, 2)); return; }
+        console.log(`  ${c.yellow}No reports found${c.reset} — "${slug}" hasn't been audited yet.`);
+        console.log(`  ${c.dim}Run: ${c.cyan}agentaudit audit <repo-url>${c.dim} to create the first audit${c.reset}`);
+        // Suggest similar packages
+        await suggestSimilarPackages(slug);
+        return;
+      }
+
       if (jsonMode) { console.log(JSON.stringify(data, null, 2)); return; }
 
       console.log();
@@ -4901,6 +5754,20 @@ async function main() {
     if (creds) {
       console.log(`  Account     ${c.bold}${creds.agent_name}${c.reset}  ${c.green}✔ logged in${c.reset}`);
       console.log(`  ${c.dim}            Key: ${creds.api_key.slice(0, 12)}...${c.reset}`);
+      // Remote scan quota
+      try {
+        const quotaRes = await fetch(`${REGISTRY_URL}/api/scan`, {
+          headers: { 'Authorization': `Bearer ${creds.api_key}` },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (quotaRes.ok) {
+          const quota = await quotaRes.json();
+          const resetLabel = quota.resets_in_ms
+            ? ` ${c.dim}(resets in ${Math.ceil(quota.resets_in_ms / 3600000)}h)${c.reset}`
+            : '';
+          console.log(`  Remote      ${c.bold}${quota.remaining}${c.reset} of ${quota.limit} free scans remaining${resetLabel}`);
+        }
+      } catch {}
     } else {
       console.log(`  Account     ${c.yellow}not configured${c.reset}  ${c.dim}— run ${c.cyan}agentaudit setup${c.dim} to create one${c.reset}`);
     }
@@ -5385,12 +6252,13 @@ async function main() {
       return;
     }
     
-    // --deep redirects to audit flow
+    // --deep redirects to audit flow (--remote supported)
     if (deepFlag) {
+      const auditFn = remoteFlag ? remoteAudit : auditRepo;
       let hasFindings = false;
       const allReports = [];
       for (const url of urls) {
-        const report = await auditRepo(url);
+        const report = await auditFn(url);
         if (Array.isArray(report)) {
           allReports.push(...report.filter(Boolean));
           if (report.some(r => r?.findings?.length > 0)) hasFindings = true;
@@ -5451,6 +6319,24 @@ async function main() {
       console.log(`  ${c.dim}Usage: ${c.cyan}agentaudit audit <url>${c.dim} — e.g. agentaudit audit https://github.com/owner/repo${c.reset}`);
       console.log(`  ${c.dim}Tip: use ${c.cyan}agentaudit discover --deep${c.dim} to find & audit locally installed MCP servers${c.reset}`);
       process.exitCode = 2;
+      return;
+    }
+
+    // --remote: use server-side scan
+    if (remoteFlag) {
+      let hasFindings = false;
+      const allReports = [];
+      for (const url of urls) {
+        const result = await remoteAudit(url);
+        if (result) {
+          allReports.push(result);
+          if (result.findings?.length > 0) hasFindings = true;
+        }
+      }
+      if (outputFormat === 'sarif') {
+        console.log(JSON.stringify(toSarif(allReports), null, 2));
+      }
+      process.exitCode = hasFindings ? 1 : 0;
       return;
     }
 

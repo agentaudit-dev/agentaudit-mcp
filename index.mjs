@@ -5,10 +5,13 @@
  * Security audit capabilities via Model Context Protocol.
  * 
  * Tools:
- *   - discover_servers  Find locally installed MCP servers + check registry status
- *   - audit_package     Clone a repo, return source code + audit prompt for LLM analysis
- *   - submit_report     Upload a completed audit report to agentaudit.dev
- *   - check_package     Look up a package in the AgentAudit registry
+ *   - discover_servers     Find locally installed MCP servers + check registry status
+ *   - audit_package        Clone a repo, return source code + audit prompt for LLM analysis
+ *   - submit_report        Upload a completed audit report to agentaudit.dev
+ *   - check_package        Look up a package in the AgentAudit registry
+ *   - consensus_analysis   Multi-auditor consensus view for a package
+ *   - search_packages      Search the registry for packages
+ *   - scan_tool_poisoning  Detect hidden instructions + manipulation in tool definitions
  * 
  * Usage:
  *   npx agentaudit                (starts MCP server via stdio)
@@ -405,6 +408,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'consensus_analysis',
+      description: 'Get multi-auditor consensus analysis for a package. Shows how many different auditors and models have scanned the package, their agreement on findings, and the overall consensus risk level. Useful for getting a second opinion on any package\'s security posture.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          package_name: {
+            type: 'string',
+            description: 'Package name or slug to look up consensus for (e.g., "fastmcp", "mongodb-mcp-server")',
+          },
+        },
+        required: ['package_name'],
+      },
+    },
+    {
+      name: 'search_packages',
+      description: 'Search the AgentAudit security registry for packages. Returns matching packages with their risk scores and audit status. Use this when you need to find a package but don\'t know the exact name.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Search query (e.g., "fastmcp", "database", "slack")',
+          },
+        },
+        required: ['query'],
+      },
+    },
+    {
       name: 'scan_tool_poisoning',
       description: 'Scan MCP tool definitions for hidden instructions, unicode tricks, obfuscated payloads, and manipulation patterns. Use this to check if a server\'s tools contain poisoning indicators (prompt injection in descriptions, zero-width characters, cross-tool manipulation, homoglyph attacks). Provide tool definitions directly OR a source_url to extract them from code.',
       inputSchema: {
@@ -698,6 +729,115 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
+    // ── consensus_analysis ──────────────────────────────────
+    case 'consensus_analysis': {
+      const { package_name } = args;
+      if (!package_name) {
+        return { content: [{ type: 'text', text: 'Error: package_name is required' }] };
+      }
+
+      try {
+        const slug = package_name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+        const res = await fetch(`${REGISTRY_URL}/api/packages/${encodeURIComponent(slug)}/consensus`, {
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!res.ok) {
+          return { content: [{ type: 'text', text: `No consensus data available for "${package_name}". It may not have been audited yet.\n\nTo audit: call \`audit_package\` with the package's source URL.` }] };
+        }
+
+        const data = await res.json();
+        const totalReports = data.total_reports || 0;
+        const totalAgents = data.total_agents || 0;
+        const agreement = data.agreement_score != null ? Math.round(data.agreement_score) : null;
+
+        if (totalReports === 0) {
+          return { content: [{ type: 'text', text: `No reports found for "${package_name}". This package hasn't been audited yet.\n\nTo audit: call \`audit_package\` with the package's source URL.` }] };
+        }
+
+        let text = `# Consensus Analysis: ${package_name}\n\n`;
+        text += `**Reports:** ${totalReports} | **Auditors:** ${totalAgents}`;
+        if (agreement != null) text += ` | **Agreement:** ${agreement}%`;
+        text += '\n\n';
+
+        // Risk consensus
+        if (data.risk_consensus) {
+          text += `**Risk Consensus:** ${data.risk_consensus.result || 'unknown'} (avg score: ${Math.round(data.risk_consensus.avg_risk_score || 0)}/100)\n\n`;
+        }
+
+        // Findings
+        const findings = data.findings || [];
+        if (findings.length > 0) {
+          text += `## Findings (${findings.length})\n\n`;
+          for (const f of findings.slice(0, 15)) {
+            const models = f.model_count || f.confirming_models || 1;
+            const sev = (f.severity || 'unknown').toUpperCase();
+            text += `- **[${sev}]** ${f.title || f.pattern_id || 'Unknown'} — confirmed by ${models} model(s)\n`;
+          }
+        }
+
+        text += `\n---\nFull report: ${REGISTRY_URL}/packages/${slug}\n`;
+        return { content: [{ type: 'text', text }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Consensus lookup failed: ${err.message}` }] };
+      }
+    }
+
+    // ── search_packages ──────────────────────────────────
+    case 'search_packages': {
+      const { query } = args;
+      if (!query) {
+        return { content: [{ type: 'text', text: 'Error: query is required' }] };
+      }
+
+      try {
+        const res = await fetch(`${REGISTRY_URL}/api/lookup?hash=${encodeURIComponent(query)}`, {
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!res.ok) {
+          return { content: [{ type: 'text', text: `Search failed: HTTP ${res.status}` }] };
+        }
+
+        const data = await res.json();
+        const reports = data.reports || [];
+        const findings = data.findings || [];
+        const total = data.total_matches || (reports.length + findings.length);
+
+        if (total === 0) {
+          return { content: [{ type: 'text', text: `No results found for "${query}". Try a different search term or check the registry: ${REGISTRY_URL}` }] };
+        }
+
+        let text = `# Search Results for "${query}"\n\nFound ${total} match(es).\n\n`;
+
+        if (reports.length > 0) {
+          text += `## Packages (${reports.length})\n\n`;
+          for (const r of reports.slice(0, 10)) {
+            const name = r.skill_slug || r.slug || 'unknown';
+            const risk = r.risk_score ?? 0;
+            const badge = risk === 0 ? '✅ SAFE' : risk <= 30 ? '⚠️ CAUTION' : '🚨 UNSAFE';
+            text += `- **${name}** — ${badge} (risk: ${risk}/100)\n`;
+            if (r.source_url) text += `  Source: ${r.source_url}\n`;
+            text += `  Registry: ${REGISTRY_URL}/packages/${name}\n`;
+          }
+        }
+
+        if (findings.length > 0) {
+          text += `\n## Related Findings (${findings.length})\n\n`;
+          for (const f of findings.slice(0, 10)) {
+            const sev = (f.severity || 'unknown').toUpperCase();
+            text += `- **[${sev}]** ${f.title || f.pattern_id || 'Unknown'}`;
+            if (f.asf_id) text += ` (${f.asf_id})`;
+            text += '\n';
+          }
+        }
+
+        return { content: [{ type: 'text', text }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Search failed: ${err.message}` }] };
+      }
+    }
+
     // ── scan_tool_poisoning ──────────────────────────────────
     case 'scan_tool_poisoning': {
       const serverName = args.server_name || 'unknown';
@@ -785,7 +925,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     default:
-      return { content: [{ type: 'text', text: `Unknown tool: ${name}. Available: discover_servers, audit_package, submit_report, check_package, scan_tool_poisoning` }] };
+      return { content: [{ type: 'text', text: `Unknown tool: ${name}. Available: discover_servers, audit_package, submit_report, check_package, consensus_analysis, search_packages, scan_tool_poisoning` }] };
   }
 });
 
